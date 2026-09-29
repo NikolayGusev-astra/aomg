@@ -49,6 +49,22 @@ def load_config(path: Path) -> Config:
         cfg.groups[gname] = Group(name=g.get("name", gname),
                                   proxy=g.get("proxy"),
                                   check=g.get("check"))
+    def _expand(s: str) -> str:
+        """${VAR} -> значение. Сначала process-env, затем User-окружение
+        Windows (HKCU\\Environment): многие секреты живут только там,
+        а os.path.expandvars их не видит и оставляет ${VAR} литералом."""
+        out = os.path.expandvars(s)
+        if out == s and s.startswith("${") and s.endswith("}"):
+            import winreg
+            name = s[2:-1]
+            try:
+                with winreg.OpenKey(winreg.HKEY_CURRENT_USER, "Environment") as k:
+                    val, _ = winreg.QueryValueEx(k, name)
+                    return str(val)
+            except OSError:
+                pass
+        return out
+
     if "direct" not in cfg.groups:
         cfg.groups["direct"] = Group(name="Дом (напрямую)", proxy=None)
     for sname, s in (raw.get("servers") or {}).items():
@@ -56,10 +72,10 @@ def load_config(path: Path) -> Config:
         if has_url == has_cmd:
             raise ValueError(
                 f"server '{sname}': нужен ровно один из url/command")
-        env = {k: os.path.expandvars(v) if isinstance(v, str) else v
-               for k, v in (s.get("env") or {}).items()}
-        headers = {k: os.path.expandvars(v) if isinstance(v, str) else v
-                   for k, v in (s.get("headers") or {}).items()}
+        env = {_k: _expand(v) if isinstance(v, str) else v
+               for _k, v in (s.get("env") or {}).items()}
+        headers = {_k: _expand(v) if isinstance(v, str) else v
+                   for _k, v in (s.get("headers") or {}).items()}
         cfg.servers[sname] = ServerSpec(
             name=sname,
             kind="http" if has_url else "stdio",

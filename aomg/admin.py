@@ -15,7 +15,7 @@ from pathlib import Path
 from fastapi import FastAPI, Request, Response
 from fastapi.responses import HTMLResponse
 
-from .config import Config, ServerSpec, atomic_save_config
+from .config import Config, ServerSpec, atomic_save_config, load_config
 from .health import Health, aggregate_state
 from .registry import REGISTRY_BASE, parse_server_entry
 from .supervisor import Supervisor
@@ -61,10 +61,21 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
     @app.get("/admin/api/catalog")
     def api_catalog(query: str = "") -> dict:
         """Поиск в официальном реестре MCP. Реестр бывает медленным (до ~45с):
-        длинный таймаут + один ретрай, дедупликация записей."""
+        длинный таймаут + один ретрай, дедупликация записей, TTL-кэш сутки
+        (повторный поиск мгновенный и не зависит от флапов реестра)."""
+        import json as _json
         import time as _time
 
         import httpx
+
+        cache: dict = getattr(api_catalog, "_cache", None)
+        if cache is None:
+            cache = api_catalog._cache = {}  # query -> (ts, items)
+
+        q = query or "mcp"
+        hit = cache.get(q)
+        if hit and _time.time() - hit[0] < 86400:
+            return {"items": hit[1], "cached": True}
         try:
             rows: list = []
             with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0),
@@ -72,8 +83,7 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                 for attempt in (1, 2):
                     try:
                         r = c.get(f"{REGISTRY_BASE}/v0/servers",
-                                  params={"search": query or "mcp",
-                                          "limit": 20})
+                                  params={"search": q, "limit": 20})
                         rows = r.json().get("servers", [])
                         break
                     except (httpx.ReadTimeout, httpx.ConnectError):
@@ -89,9 +99,14 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                     e = parse_server_entry(x)
                 except ValueError:
                     continue  # deprecated/inactive — пропускаем
-                if e.name in seen:
-                    continue  # реестр отдаёт дубли
+                # дедуп по полному имени, затем по короткому (реестр отдаёт
+                # один пакет под несколькими namespace: io.github.x/mcp,
+                # io.y/mcp -> короткое 'mcp' трижды)
+                short = (e.name or "").split("/")[-1]
+                if e.name in seen or short in seen:
+                    continue
                 seen.add(e.name)
+                seen.add(short)
                 entries.append(e)
             items = []
             for e in entries:
@@ -107,8 +122,13 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                     "description": (e.description or "")[:140],
                     "install": install,
                     "form_fields": e.form_fields})
+            if items:
+                cache[q] = (_time.time(), items)
             return {"items": items}
         except Exception as ex:
+            # упавший реестр не должен смывать вчерашний кэш
+            if hit:
+                return {"items": hit[1], "cached": True}
             return {"items": [], "error": str(ex)[:150]}
 
     @app.get("/admin/api/groups")
@@ -168,6 +188,15 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
             return {"error": "нужен url или command"}
         servers[name] = entry
         save_raw(raw)
+        # рантайм-конфиг обязан увидеть новую запись ДО ensure(), иначе
+        # supervisor молча пропустит спавн (баг: запись в yaml была,
+        # а в списке сервер не появлялся до полного рестарта AOMG)
+        try:
+            reloaded = load_config(config_path)
+            cfg.groups = reloaded.groups
+            cfg.servers = reloaded.servers
+        except Exception:
+            pass  # битый yaml не роняем — ensure() просто не найдёт запись
         supervisor.ensure(name)
         return {"saved": name}
 
@@ -304,6 +333,9 @@ async function restart(n){ await fetch(`/admin/api/servers/${n}/restart`,{method
 async function del(n){ if(!confirm('Удалить '+n+'?'))return;
   await fetch(`/admin/api/servers/${n}/delete`,{method:'POST'}); refresh(); }
 let tmr; let searching=false;
+let CAT_ITEMS=[];
+function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
+  .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 function search(){ clearTimeout(tmr);
   tmr=setTimeout(async()=>{
     const q=document.getElementById('q').value;
@@ -313,11 +345,16 @@ function search(){ clearTimeout(tmr);
     cat.innerHTML='<div><span>ищу в реестре… (бывает до минуты)</span></div>';
     try{
       const d=await (await fetch(`/admin/api/catalog?query=${encodeURIComponent(q)}`)).json();
-      cat.innerHTML=(d.items||[]).map(i=>`
-        <div onclick='pick(${JSON.stringify(i).replaceAll("'", "&#39;")})'>
-          <b>${i.title||i.name}</b><span>${(i.description||'').slice(0,90)}</span>
+      CAT_ITEMS = d.items||[];
+      cat.innerHTML = CAT_ITEMS.map((i,idx)=>`
+        <div data-idx="${idx}" class="cat-item" style="cursor:pointer">
+          <b>${esc(i.title||i.name)}</b><span>${esc((i.description||'').slice(0,90))}</span>
         </div>`).join('') || '<div><span>ничего не найдено</span></div>';
-      if(d.error) cat.innerHTML+=`<div><span style="color:var(--err)">${d.error}</span></div>`;
+      if(d.error) cat.innerHTML+=`<div><span style="color:var(--err)">${esc(d.error)}</span></div>`;
+      if(d.cached) cat.innerHTML+='<div><span style="opacity:.6">из кэша</span></div>';
+      cat.querySelectorAll('.cat-item').forEach(el=>{
+        el.addEventListener('click', ()=>pick(CAT_ITEMS[+el.dataset.idx]));
+      });
     }catch(e){
       cat.innerHTML='<div><span style="color:var(--err)">реестр недоступен</span></div>';
     }

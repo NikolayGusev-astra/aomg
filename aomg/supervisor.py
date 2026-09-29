@@ -45,6 +45,12 @@ class ManagedServer:
             env.setdefault("HTTPS_PROXY", egress)
             env.setdefault("HTTP_PROXY", egress)
             env.setdefault("ALL_PROXY", egress)
+        else:
+            # без egress дети не должны наследовать прокси хоста: exe
+            # с httpx игнорирует NO_PROXY="*" и ломается о чужой socks
+            for k in ("HTTPS_PROXY", "HTTP_PROXY", "ALL_PROXY",
+                      "https_proxy", "http_proxy", "all_proxy"):
+                env.pop(k, None)
         env["NO_PROXY"] = self.spec.env.get(
             "NO_PROXY", "127.0.0.1,localhost")
         self.proxy_port = _free_port()
@@ -59,6 +65,10 @@ class ManagedServer:
                 [*proxy_cmd,
                  "--port", str(self.proxy_port), "--host", "127.0.0.1",
                  "--pass-environment",
+                 # "--" обязателен: без него mcp-proxy съедает флаги
+                 # команды (npx -y ... -> '-y' парсится как свой флаг,
+                 # argv-ошибка, ребёнок мгновенно умирает)
+                 "--",
                  self.spec.command, *self.spec.args],
                 stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL, env=env,
