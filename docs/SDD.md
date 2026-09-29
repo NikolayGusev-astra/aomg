@@ -29,11 +29,18 @@ Health = {state: "ok"|"reconnecting"|"down"|"channel_down",
 
 ```
 run.py            точка входа: config load, uvicorn-поток, pystray в main
-aomg/config.py    загрузка/сохранение config.yaml, atomic write
-aomg/supervisor.py  спавн stdio-детей (порт-прокси pair), рестарт, pin-версии
+aomg/config.py    загрузка/сохранение config.yaml, atomic write;
+                  ${VAR} подставляется из process-env и HKCU\Environment
+aomg/supervisor.py  спавн stdio-детей (порт-прокси pair, "--" перед командой),
+                  рестарт, pin-версии; без egress прокси-переменные хоста
+                  из окружения ребёнка удаляются
 aomg/gateway.py   FastAPI: /<name>/mcp -> прокси к ребенку или апстриму
 aomg/watchdog.py  периодический initialize+tools/list через egress группы
 aomg/registry.py  клиент registry.modelcontextprotocol.io (/v0/servers)
+aomg/catalog.py   поиск с TTL-кэшем 24ч (при недоступном реестре отдаётся
+                  устаревший кэш)
+aomg/admin.py     веб-панель: статусы, каталог, форма ключей, рестарт;
+                  добавление сервера перечитывает рантайм-конфиг до спавна
 aomg/client_sync.py  прописывание url-записей в конфиг MCP-клиента
 aomg/tray.py      pystray: цвет по Health-агрегату, меню, "Перезапустить всё"
 ```
@@ -53,6 +60,16 @@ aomg/tray.py      pystray: цвет по Health-агрегату, меню, "П�
 
 ## Не в v0.1
 
-GUI-каталог в окне (v0.2: CLI-команды + простое tk-окно), PyInstaller-сборка,
-алерт в TG, fallback-цепочки в рантайме (задаётся в конфиге, но логика проб
-только primary), удалённый доступ к гейтвею (только 127.0.0.1).
+Алерты в TG, fallback-цепочки в рантайме (задаётся в конфиге, но логика проб
+только primary), удалённый доступ к гейтвею (только 127.0.0.1), порт на Rust.
+
+## Известные грабли (не повторять)
+
+- mcp-proxy 0.9.0 пин: 0.10+ сломаны для сценария stdio-проксирования.
+- Маршрут ребёнка внутри mcp-proxy — `/mcp/` с trailing slash.
+- В спавне обязателен `--` перед командой: иначе `npx -y pkg` теряет `-y`
+  (парсится как флаг mcp-proxy), ребёнок циклически перезапускается.
+- Дети без egress не должны наследовать HTTPS_PROXY/HTTP_PROXY хоста:
+  httpx-клиенты игнорируют `NO_PROXY="*"`.
+- `${VAR}` секреты могут жить только в User-окружении Windows
+  (HKCU\Environment) — process-env их не содержит.

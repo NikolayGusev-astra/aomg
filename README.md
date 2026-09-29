@@ -4,7 +4,10 @@
 (stdio) и серверных (HTTP) MCP-серверов. Один процесс, один порт — все твои
 MCP в одном месте.
 
-![banner](assets/assets/banner.png)
+![banner](assets/banner.png)
+
+![демо](docs/media/aomg-demo.gif)
+*18 секунд: панель, каталог из реестра, watchdog. Видео целиком: [docs/media/aomg-demo.mp4](docs/media/aomg-demo.mp4)*
 
 > Python/MVP-фаза. В планах — порт на Rust (Tauri v2 + rmcp + axum).
 
