@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+
+# Сборка PyInstaller
+build/
+dist/
+*.spec.bak
+
+# Локальные конфиги и секреты (в репо только config.example.yaml)
+config.yaml
+*.local.yaml
+.env
+
+# Логи и временные файлы
+*.log
+*.tmp
+*.yaml.tmp
+
+# ОС
+Thumbs.db
+.DS_Store
+
+# Внутренний README с личными заметками - не публикуем
+README-internal.md
+
+# Вывод /brag и черновики
+brag-output-*/

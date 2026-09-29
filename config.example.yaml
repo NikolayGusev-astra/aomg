@@ -1,0 +1,33 @@
+# AOMG example config — скопируй в config.yaml и поправь под себя
+# Секреты: только ${VAR}-плейсхолдеры, значения берутся из окружения при старте.
+gateway_port: 9300
+
+groups:
+  direct:    {name: "Дом (напрямую)", proxy: null}
+  vpn:       {name: "Через VPN",      proxy: "socks5://127.0.0.1:10808"}
+  corporate: {name: "Рабочая сеть",   proxy: "http://corp-gw:3128"}
+
+servers:
+  # Локальный stdio-сервер (npm/npx):
+  weather:
+    command: "uvx"
+    args: ["mcp-server-weather"]
+    group: direct
+
+  # Удалённый HTTP-сервер с ключом:
+  github:
+    url: "https://api.githubcopilot.com/mcp/"
+    group: vpn
+    headers: {Authorization: "Bearer ${GITHUB_PAT}"}
+
+  # Локальный exe с env-секретом; NO_PROXY="*" - корпоративные дети не ходят через прокси:
+  my-corp-mcp:
+    command: "C:/tools/corp-mcp.exe"
+    group: corporate
+    env: {API_KEY: "${CORP_KEY}", NO_PROXY: "*"}
+
+  # Дымовый сервер из tests/ - можно запустить сразу и проверить панель:
+  fake:
+    command: "python"
+    args: ["tests/fixtures/fake_stdio_server.py"]
+    group: direct

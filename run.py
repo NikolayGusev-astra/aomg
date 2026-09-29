@@ -1,0 +1,65 @@
+"""AOMG entry point.
+
+run.py [--no-tray] [--config PATH]
+Env: AOMG_CONFIG (default: ./config.yaml рядом с run.py)
+"""
+from __future__ import annotations
+
+import argparse
+import os
+import signal
+import sys
+import time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+from aomg.config import load_config
+from aomg.gateway import create_app, serve_in_thread
+from aomg.health import Health
+from aomg.supervisor import Supervisor
+from aomg.watchdog import start_watchdog
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(prog="AOMG")
+    ap.add_argument("--no-tray", action="store_true")
+    ap.add_argument("--config", default=None)
+    args = ap.parse_args()
+
+    cfg_path = (Path(args.config) if args.config else Path(
+        os.environ.get("AOMG_CONFIG",
+                       Path(__file__).parent / "config.yaml")))
+    cfg = load_config(cfg_path)
+    healths = {n: Health() for n in cfg.servers}
+
+    sup = Supervisor(cfg)
+    sup.start_all()
+
+    from aomg.admin import register_admin
+
+    def configure(app):
+        register_admin(app, cfg, sup, healths, cfg_path,
+                       restart_watchdog=lambda: None)
+
+    gw_thread = serve_in_thread(cfg, sup, healths, configure=configure)
+    start_watchdog(cfg, sup, healths, interval=30.0)
+
+    if args.no_tray:
+        while gw_thread.is_alive():
+            time.sleep(1)
+        return 0
+
+    from aomg.tray import run_tray
+
+    def on_quit():
+        sup.stop_all()
+        os._exit(0)
+
+    signal.signal(signal.SIGTERM, lambda *_: on_quit())
+    run_tray(healths, sup, on_quit, gateway_port=cfg.gateway_port)
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

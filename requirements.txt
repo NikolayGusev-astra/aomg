@@ -1,0 +1,15 @@
+# Зависимости AOMG (Python 3.11+)
+# mcp-proxy пин: 0.10+ несовместимы с mcp SDK (request_ctx/streamablehttp_client)
+fastapi>=0.115
+uvicorn>=0.30
+httpx>=0.27
+pyyaml>=6.0
+pystray==0.19.5
+pillow>=10.0
+mcp>=1.9,<2
+mcp-proxy==0.9.0
+
+# dev/test
+pytest>=8.0
+pytest-asyncio>=0.23
+pyinstaller>=6.0 ; python_version >= "3.11"
