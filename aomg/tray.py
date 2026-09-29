@@ -31,7 +31,7 @@ def _app_icon() -> Image.Image | None:
         candidates.append(me / "_internal" / "assets" / "app-icon.png")
         candidates.append(me / "assets" / "app-icon.png")
     here = Path(__file__).resolve().parent.parent
-    candidates.append(here / "assets" / "assets" / "app-icon.png")
+    candidates.append(here / "assets" / "app-icon.png")
     for p in candidates:
         if p.exists():
             try:

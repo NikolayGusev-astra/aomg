@@ -45,7 +45,7 @@ aomg/tray.py      pystray: цвет по Health-агрегату, меню, "П�
 3. HTTP-апстрим через группу с прокси: запрос уходит с proxy-клиентом группы.
 4. Апстрим недоступен, egress-канал недоступен → state=channel_down (не down).
 5. Апстрим отвечает 500/битым JSON-RPC → state=down.
-6. hermes_sync: после запуска в конфиге клиента есть url-запись; idempotent.
+6. client_sync: после запуска в конфиге клиента есть url-запись; idempotent.
 7. Registry: search отдаёт записи; для записей с headers → форма содержит
    поле секрета; для packages → kind=stdio + pin версии.
 8. Watchdog пишет историю Health; иконка = worst-of (down красная,
