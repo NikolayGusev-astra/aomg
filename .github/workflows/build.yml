@@ -6,24 +6,32 @@ on:
   workflow_dispatch:
 
 jobs:
+  # Тесты — до сборки. Без этого шага зелёный статус сборки ничего
+  # не говорил о коде: ни одного прогона тестов в CI не было.
+  test:
+    runs-on: windows-latest      # AOMG — Windows-only (ADR-0006)
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pytest
+
+      - name: Run suite
+        run: python -m pytest tests -q
+
   build:
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - os: windows-latest
-            artifact: AOMG-windows
-            exe_ext: .exe
-            pyinstaller_opts: ""
-          - os: ubuntu-latest
-            artifact: AOMG-linux
-            exe_ext: ""
-            pyinstaller_opts: ""
-          - os: macos-latest
-            artifact: AOMG-macos
-            exe_ext: ""
-            pyinstaller_opts: ""
-    runs-on: ${{ matrix.os }}
+    needs: test
+    # ADR-0006: Windows-only. supervisor/tray/frozen-пути содержат
+    # Windows-only предположения (CREATE_NO_WINDOW, панель задач, .exe),
+    # поэтому Linux/macOS-артефакты были сборкой неработоспособного:
+    # они собирались, скачивались и не запускались.
+    runs-on: windows-latest
     steps:
       - uses: actions/checkout@v4
 
@@ -45,16 +53,19 @@ jobs:
       - name: Assemble bundle
         shell: bash
         run: |
-          cp dist/mcp-proxy/mcp-proxy${{ matrix.exe_ext }} dist/AOMG/
+          cp dist/mcp-proxy/mcp-proxy.exe dist/AOMG/
           cp -r dist/mcp-proxy/mcp_proxy_internal dist/AOMG/
-          cp config.example.yaml dist/AOMG/
-          cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz AOMG/
+          # example-конфиг едет в docs/, а не рядом с exe: первый запуск
+          # сам создаёт чистый config.yaml с проверенным портом
+          mkdir -p dist/AOMG/docs
+          cp config.example.yaml dist/AOMG/docs/
+          cd dist && tar -czf ../AOMG-windows.tar.gz AOMG/
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
-          name: ${{ matrix.artifact }}
-          path: ${{ matrix.artifact }}.tar.gz
+          name: AOMG-windows
+          path: AOMG-windows.tar.gz
 
   release:
     needs: build
@@ -72,6 +83,4 @@ jobs:
         with:
           files: |
             AOMG-windows.tar.gz
-            AOMG-linux.tar.gz
-            AOMG-macos.tar.gz
           generate_release_notes: true
