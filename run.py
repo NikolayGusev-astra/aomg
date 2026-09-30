@@ -36,6 +36,19 @@ def main() -> int:
     ap.add_argument("--config", default=None)
     args = ap.parse_args()
 
+    # Запуск двойным кликом: sys.stdout/stderr == None (нет консоли),
+    # uvicorn-форматтер падает на .isatty() при настройке логов.
+    # Перенаправляем в файл (или devnull) ДО инициализации uvicorn.
+    if getattr(sys, "frozen", False) and sys.stdout is None:
+        log_dir = _app_dir() / "logs"
+        try:
+            log_dir.mkdir(parents=True, exist_ok=True)
+            sys.stdout = open(log_dir / "aomg.log", "a",
+                              encoding="utf-8", errors="replace")
+        except OSError:
+            sys.stdout = open(os.devnull, "w")
+        sys.stderr = sys.stdout
+
     cfg_path = (Path(args.config) if args.config else Path(
         os.environ.get("AOMG_CONFIG",
                        _app_dir() / "config.yaml")))
