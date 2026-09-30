@@ -44,6 +44,17 @@ def _is_secret(k: str) -> bool:
     return bool(_SECRET_RE.search(k))
 
 
+_SECRET_KEY_NAMES = {"authorization", "proxy-authorization", "cookie"}
+
+
+def _mask_headers(hdrs: dict) -> dict:
+    """Секреты в заголовках маскируются: по имени ключа (key/token/…) и
+    по классическим носителям (Authorization, Cookie)."""
+    return {k: ("***" if v and (_is_secret(k)
+                                or k.lower() in _SECRET_KEY_NAMES) else v)
+            for k, v in hdrs.items()}
+
+
 def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                    healths: dict[str, Health], config_path: Path,
                    restart_watchdog: callable) -> None:
@@ -75,15 +86,138 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
         return {"servers": [spec_to_public(n, s)
                             for n, s in cfg.servers.items()]}
 
-    @app.get("/admin/api/catalog")
-    def api_catalog(query: str = "") -> dict:
-        """Поиск в официальном реестре MCP через локальный индекс (aomg/index.py):
-        поиск мгновенный, по дисковому снапшоту; реестр ходит только фоновая
-        синхронизация (stale-while-revalidate). Если индекса ещё нет — один
-        живой запрос с коротким таймаутом, чтобы не висеть минуту."""
-        import time as _time
+    # ---- каталог: источники (ADR-0002) ----
 
+    def _build_catalog_sources(cfg_obj: Config) -> dict:
+        """official + neuraldeep (встроенные) + json-источники из конфига."""
+        from .json_source import JsonSource
+        sources: dict = {"official": _OfficialIndexAdapter(
+            config_path.parent / "registry-index.json")}
+        nd_spec = cfg_obj.catalog_sources.get("neuraldeep")
+        if not (nd_spec and nd_spec.hidden):
+            from .catalog import NeuralDeepSource
+            sources["neuraldeep"] = NeuralDeepSource()
+        for name, spec in cfg_obj.catalog_sources.items():
+            if spec.type == "json":
+                sources[name] = JsonSource(spec, cache_dir=config_path.parent)
+        return sources
+
+    class _OfficialIndexAdapter:
+        """Тонкая обёртка CatalogIndex под интерфейс источников каталога."""
+
+        name = "official"
+
+        def __init__(self, index_path: Path):
+            from .index import CatalogIndex
+            self._idx = CatalogIndex(index_path)
+
+        def state_info(self) -> dict:
+            age = self._idx.age()
+            if age is None:
+                return {"state": "error", "error": "index not built yet"}
+            return {"state": "ok", "error": None}
+
+        def search(self, query: str, limit: int = 20) -> list[dict]:
+            stale = self._idx.is_stale()
+            items = self._idx.search(query, limit=limit)
+            if not items:
+                try:
+                    entries = registry_search(query, limit=limit)
+                    items = [c for c in
+                             (_entry_to_item(e) for e in entries) if c]
+                except Exception:
+                    pass
+            elif stale:
+                self._idx.ensure_fresh()
+            for card in items:
+                card.setdefault("source", "official")
+            return items
+
+    app.state.catalog_sources = _build_catalog_sources(cfg)
+    BUILTIN_SOURCES = ("official", "neuraldeep")
+
+    def _source_public(name: str, src) -> dict:
+        if name == "official":
+            info = src.state_info()
+        elif hasattr(src, "state"):          # JsonSource
+            info = {"state": src.state, "error": src.error}
+        else:                                 # NeuralDeepSource — ленивый
+            info = {"state": "ok", "error": None}
+        spec = cfg.catalog_sources.get(name)
+        out = {"name": name,
+               "type": spec.type if spec else
+                       ("json" if name == "neuraldeep" else "builtin"),
+               "group": spec.group if spec else "direct",
+               "hidden": spec.hidden if spec else False,
+               **info}
+        if spec and spec.url:
+            out["url"] = spec.url
+        if spec and spec.headers:
+            out["headers"] = _mask_headers(spec.headers)
+        return out
+
+    @app.get("/admin/api/catalog/sources")
+    def api_catalog_sources() -> dict:
+        # official всегда первый
+        srcs = app.state.catalog_sources
+        names = [n for n in ("official", "neuraldeep") if n in srcs] + \
+                [n for n in srcs if n not in BUILTIN_SOURCES]
+        return {"sources": [_source_public(n, srcs[n]) for n in names]}
+
+    @app.post("/admin/api/catalog/sources")
+    async def api_catalog_source_upsert(request: Request) -> dict:
+        data = await request.json()
+        name = re.sub(r"[^a-z0-9_-]", "", (data.get("name") or "").lower())
+        if not name or name in BUILTIN_SOURCES:
+            return {"error": "bad name"}
+        if data.get("type") != "json" or not data.get("url"):
+            return {"error": "type=json и url обязательны"}
+        raw = raw_config()
+        raw.setdefault("catalog_sources", {})[name] = {
+            "type": "json", "url": data["url"],
+            "group": data.get("group") or "direct",
+            "headers": data.get("headers") or {}}
+        save_raw(raw)
+        try:
+            reloaded = load_config(config_path)
+            cfg.catalog_sources = reloaded.catalog_sources
+        except Exception:
+            pass
+        app.state.catalog_sources = _build_catalog_sources(cfg)
+        return {"saved": name}
+
+    @app.post("/admin/api/catalog/sources/{name}/delete")
+    def api_catalog_source_delete(name: str) -> dict:
+        if name in BUILTIN_SOURCES:
+            return {"error": "builtin"}
+        raw = raw_config()
+        if name not in (raw.get("catalog_sources") or {}):
+            return {"error": "unknown"}
+        raw["catalog_sources"].pop(name)
+        save_raw(raw)
+        cfg.catalog_sources.pop(name, None)
+        app.state.catalog_sources.pop(name, None)
+        return {"deleted": name}
+
+    @app.get("/admin/api/catalog")
+    def api_catalog(query: str = "", source: str = "") -> dict:
+        """Поиск по каталогу. source='' или 'official' — локальный индекс
+        реестра (aomg/index.py, мгновенный, stale-while-revalidate);
+        другой source — соответствующий источник из catalog_sources."""
         from . import index as _index
+
+        src_name = source or "official"
+        src = app.state.catalog_sources.get(src_name)
+        if src is None:
+            return {"items": [], "error": f"unknown source: {src_name}"}
+
+        if src_name != "official":
+            items = src.search(query or "", limit=20)
+            out: dict = {"items": items, "source": src_name}
+            if getattr(src, "state", "ok") != "ok":
+                out["error"] = getattr(src, "error", None) or src.state
+                out["items"] = []
+            return out
 
         idx: _index.CatalogIndex = getattr(api_catalog, "_index", None)
         if idx is None:
@@ -96,23 +230,23 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
         if items:
             if stale:
                 idx.ensure_fresh()  # фоново обновит, ответ не ждём
-            return {"items": items, "cached": stale, "source": "index"}
+            return {"items": items, "cached": stale, "source": "official"}
         # индекс пуст (первый запуск и sync ещё не дошёл) — живой фолбэк
         try:
             entries = registry_search(q, limit=20)
         except Exception as ex:
-            return {"items": [], "error": str(ex)[:150]}
+            return {"items": [], "error": str(ex)[:150], "source": "official"}
         items = [_entry_to_item(e) for e in entries if _entry_to_item(e)]
         if items:
             try:
                 idx.ensure_fresh()  # дольём полный индекс в фоне
             except Exception:
                 pass
-            return {"items": items, "cached": False, "source": "live"}
+            return {"items": items, "cached": False, "source": "official"}
         # пусто и в реестре: возможно, индекс протух — обновим в фоне
         if stale:
             idx.ensure_fresh()
-        return {"items": [], "cached": False, "source": "live"}
+        return {"items": [], "cached": False, "source": "official"}
 
     @app.get("/admin/api/groups")
     def api_groups() -> dict:
