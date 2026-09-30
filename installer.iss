@@ -42,8 +42,10 @@ Name: "autostart"; Description: "Запускать AOMG при входе в Wi
     Flags: unchecked
 
 [Files]
-Source: "dist\AOMG.exe"; DestDir: "{app}"; Flags: ignoreversion
-Source: "dist\mcp-proxy.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\AOMG\AOMG.exe"; DestDir: "{app}"; Flags: ignoreversion
+Source: "dist\AOMG\_internal\*"; DestDir: "{app}\_internal"; \
+    Flags: ignoreversion recursesubdirs createallsubdirs
+Source: "dist\AOMG\mcp-proxy.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "config.example.yaml"; DestDir: "{app}"; Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion

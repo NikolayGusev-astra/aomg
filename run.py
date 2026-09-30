@@ -21,6 +21,15 @@ from aomg.supervisor import Supervisor
 from aomg.watchdog import start_watchdog
 
 
+def _app_dir() -> Path:
+    """Папка установки. В frozen (PyInstaller onefile) __file__ указывает
+    на временную папку распаковки _MEIxxxx — конфиг ищем рядом с самим exe,
+    как это делают иконка ярлыка и пользователь."""
+    if getattr(sys, "frozen", False):
+        return Path(sys.executable).parent
+    return Path(__file__).resolve().parent
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(prog="AOMG")
     ap.add_argument("--no-tray", action="store_true")
@@ -29,7 +38,7 @@ def main() -> int:
 
     cfg_path = (Path(args.config) if args.config else Path(
         os.environ.get("AOMG_CONFIG",
-                       Path(__file__).parent / "config.yaml")))
+                       _app_dir() / "config.yaml")))
     cfg = load_config(cfg_path)
     healths = {n: Health() for n in cfg.servers}
 

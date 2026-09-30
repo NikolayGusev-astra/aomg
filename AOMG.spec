@@ -1,5 +1,8 @@
 # -*- mode: python ; coding: utf-8 -*-
-# AOMG PyInstaller spec: onefile windowed exe с иконкой.
+# AOMG PyInstaller spec: ONEDIR (папка dist/AOMG), windowed, с иконкой.
+# Onedir вместо onefile: инсталлятор жмёт сырые .pyd/.dll сильно лучше,
+# чем повторное сжатие onefile-архива; и нет распаковки _MEIxxxx в temp
+# при каждом старте. mcp-proxy.exe (mcpproxy.spec) кладём рядом с AOMG.exe.
 import os
 
 a = Analysis(
@@ -19,10 +22,13 @@ a = Analysis(
     excludes=[], noarchive=False)
 pyz = PYZ(a.pure)
 
-exe = EXE(pyz, a.scripts, a.binaries, a.datas,
+exe = EXE(pyz, a.scripts, [],
+          exclude_binaries=True,
           name="AOMG",
           icon="assets/app-icon.ico" if os.path.exists(
               "assets/app-icon.ico") else None,
           console=False,            # трей-приложение: без консоли
           disable_windowed_traceback=False,
           upx=False)
+coll = COLLECT(exe, a.binaries, a.datas,
+               name="AOMG")
