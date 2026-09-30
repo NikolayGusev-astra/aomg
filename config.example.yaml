@@ -8,10 +8,11 @@ groups:
   corporate: {name: "Рабочая сеть",   proxy: "http://corp-gw:3128"}
 
 servers:
-  # Локальный stdio-сервер (npm/npx):
+  # Локальный stdio-сервер (npm/npx). ВАЖНО: pin версии, если пакет
+  # тянет mcp 2.x (FastMCP переименован в MCPServer) - тогда '<2':
   weather:
     command: "uvx"
-    args: ["mcp-server-weather"]
+    args: ["--from", "mcp-server-weather", "mcp-server-weather"]
     group: direct
 
   # Удалённый HTTP-сервер с ключом:
@@ -26,7 +27,8 @@ servers:
     group: corporate
     env: {API_KEY: "${CORP_KEY}", NO_PROXY: "*"}
 
-  # Дымовый сервер из tests/ - можно запустить сразу и проверить панель:
+  # Дымовый сервер из tests/ - путь ОТНОСИТЕЛЬНО КОРНЯ РЕПО (запуск из исходников).
+  # Для установленного exe используй абсолютный путь или убери этот сервер.
   fake:
     command: "python"
     args: ["tests/fixtures/fake_stdio_server.py"]

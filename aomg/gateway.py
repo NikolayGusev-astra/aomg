@@ -65,10 +65,23 @@ def create_app(cfg: Config, supervisor: Supervisor,
 
     @app.get("/health")
     def health() -> dict:
+        from .supervisor import last_error
         return {"aggregate": aggregate_state(list(healths.values())),
                 "servers": [{"name": n, "state": h.state, "tools": h.tools,
-                             "pid": h.pid, "error": h.error}
+                             "pid": h.pid, "error": h.error,
+                             "log_tail": last_error(n)}
                             for n, h in healths.items()]}
+
+    @app.get("/admin/api/logs/{name}")
+    def server_log(name: str) -> dict:
+        """Полный лог сервера (для панели/отладки)."""
+        from .supervisor import logs_dir
+        p = logs_dir() / f"{name}.log"
+        try:
+            text = p.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            text = ""
+        return {"name": name, "log": text[-20000:]}
 
     @app.post("/admin/restart/{name}")
     def restart(name: str) -> dict:

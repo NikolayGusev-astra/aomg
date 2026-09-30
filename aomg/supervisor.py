@@ -3,6 +3,11 @@
 Каждый stdio-сервер получает свой mcp-proxy на свободном порту 127.0.0.1;
 прокси сам спавнит и держит ребёнка. Смерть ребёнка = отказ handshake —
 это ловит watchdog, рестарт = перезапуск прокси.
+
+Логи: stdout/stderr каждого mcp-proxy (и ребёнка) пишутся в файл
+<logs_dir>/<name>.log (ротация: при превышении LOG_MAX байтов файл
+переименовывается в <name>.log.old). logs_dir: <app_dir>/logs
+(frozen) или ./logs; путь настраивается через set_logs_dir().
 """
 from __future__ import annotations
 
@@ -20,6 +25,63 @@ from .health import Health
 VENV = Path(sys.executable).parent
 MCP_PROXY_PORT_BASE = 9400
 
+LOG_MAX = 512 * 1024          # ротация одного лог-файла
+LOG_TAIL = 400                # хвост ошибки для /health
+_logs_dir: Path | None = None
+
+
+def set_logs_dir(path: Path) -> None:
+    global _logs_dir
+    _logs_dir = path
+    path.mkdir(parents=True, exist_ok=True)
+
+
+def logs_dir() -> Path:
+    global _logs_dir
+    if _logs_dir is None:
+        if getattr(sys, "frozen", False):
+            _logs_dir = Path(sys.executable).parent / "logs"
+        else:
+            _logs_dir = Path.cwd() / "logs"
+        _logs_dir.mkdir(parents=True, exist_ok=True)
+    return _logs_dir
+
+
+def _rotate(path: Path) -> None:
+    try:
+        if path.exists() and path.stat().st_size > LOG_MAX:
+            old = path.with_suffix(".log.old")
+            if old.exists():
+                old.unlink()
+            path.rename(old)
+    except OSError:
+        pass
+
+
+def _open_log(name: str):
+    """Открыть лог-файл сервера на дозапись (или DEVNULL при ошибке)."""
+    try:
+        p = logs_dir() / f"{name}.log"
+        _rotate(p)
+        return open(p, "a", encoding="utf-8", errors="replace")
+    except OSError:
+        return subprocess.DEVNULL
+
+
+def last_error(name: str) -> str | None:
+    """Хвост лога сервера — для /health и панели."""
+    for p in (logs_dir() / f"{name}.log",
+              logs_dir() / f"{name}.log.old"):
+        try:
+            if p.exists():
+                text = p.read_text(encoding="utf-8", errors="replace")
+                lines = [l for l in text.strip().splitlines() if l.strip()]
+                if lines:
+                    return "\n".join(lines[-5:])[:LOG_TAIL]
+        except OSError:
+            continue
+    return None
+
 
 def _free_port() -> int:
     with socket.socket() as s:
@@ -35,6 +97,7 @@ class ManagedServer:
         self.health = health
         self.proc: subprocess.Popen | None = None
         self.proxy_port: int | None = None
+        self._log_fh = None
 
     def start(self, cfg: Config) -> None:
         if self.spec.kind != "stdio" or (self.proc and self.proc.poll() is None):
@@ -61,17 +124,32 @@ class ManagedServer:
                                  / "mcp-proxy.exe")]
             else:
                 proxy_cmd = [str(VENV / "python.exe"), "-m", "mcp_proxy"]
+            if self._log_fh:
+                try:
+                    self._log_fh.close()
+                except OSError:
+                    pass
+            stamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            self._log_fh = _open_log(self.spec.name)
+            fh = self._log_fh
+            try:
+                fh.write(f"\n===== spawn {stamp}: "
+                         f"{self.spec.command} {' '.join(self.spec.args)}\n")
+                fh.flush()
+            except (OSError, ValueError):
+                fh = subprocess.DEVNULL
             self.proc = subprocess.Popen(
                 [*proxy_cmd,
                  "--port", str(self.proxy_port), "--host", "127.0.0.1",
                  "--pass-environment",
+                 "--log-level", "DEBUG",
                  # "--" обязателен: без него mcp-proxy съедает флаги
                  # команды (npx -y ... -> '-y' парсится как свой флаг,
                  # argv-ошибка, ребёнок мгновенно умирает)
                  "--",
                  self.spec.command, *self.spec.args],
-                stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL, env=env,
+                stdin=subprocess.DEVNULL, stdout=fh,
+                stderr=subprocess.STDOUT, env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW)
             self.health.pid = self.proc.pid
         except FileNotFoundError as e:
@@ -89,6 +167,12 @@ class ManagedServer:
                 self.proc.wait(timeout=3)
             except subprocess.TimeoutExpired:
                 self.proc.kill()
+        if self._log_fh:
+            try:
+                self._log_fh.close()
+            except OSError:
+                pass
+            self._log_fh = None
 
 
 class Supervisor:
