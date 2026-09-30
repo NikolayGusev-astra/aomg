@@ -44,12 +44,18 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("CORP_TOKEN", "topsecret-123")
     cfg = load_config(cfg_file)
 
+    # Живой реестр в тестах не трогаем: фолбэк обязан быть быстрым и
+    # детерминированным, а не зависеть от сети (ADR-0005 I4).
+    async def no_registry(*a, **kw):
+        raise httpx.ReadTimeout("network disabled in tests")
+    monkeypatch.setattr("aomg.registry.search_async", no_registry)
+
     # подменяем транспорт у всех JsonSource после их создания в register_admin
     app = FastAPI()
     sup = Supervisor(cfg)
-    healths = {}
     restart_watchdog = lambda: None
-    register_admin(app, cfg, sup, healths, cfg_file, restart_watchdog)
+    # healths больше не параметр: состоянием владеет Supervisor (ADR-0003)
+    register_admin(app, cfg, sup, cfg_file, restart_watchdog)
 
     # находим созданные источники и подменяем транспорт
     sources = getattr(app.state, "catalog_sources", {})
@@ -65,6 +71,42 @@ def client(tmp_path, monkeypatch):
     c.cfg = cfg
     c.cfg_file = cfg_file
     yield c
+
+
+def test_malformed_json_body_is_reported_not_500(client):
+    """Кривое тело -> внятная ошибка, а не 500 с трейсбеком.
+
+    Найдено на установленной сборке: опечатка в JSON от curl/панели
+    роняла эндпоинт с Internal Server Error. Ошибка ввода — это 400,
+    а не авария.
+    """
+    for url in ("/admin/api/servers", "/admin/api/catalog/sources"):
+        r = client.post(url, content=b"{not json",
+                        headers={"Content-Type": "application/json"})
+        assert r.status_code == 200, f"{url} -> {r.status_code}"
+        assert "error" in r.json(), f"{url}: нет сообщения об ошибке"
+        assert "JSON" in r.json()["error"], r.json()
+
+
+def test_json_body_helper_rejects_non_dict():
+    from aomg.admin import _json_body
+
+    class _Req:
+        def __init__(self, payload):
+            self._p = payload
+
+        async def json(self):
+            if isinstance(self._p, Exception):
+                raise self._p
+            return self._p
+
+    import asyncio
+    assert asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        _json_body(_Req({"ok": 1}))) == {"ok": 1}
+    assert asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        _json_body(_Req(ValueError("bad")))) is None
+    assert asyncio.get_event_loop_policy().new_event_loop().run_until_complete(
+        _json_body(_Req([1, 2]))) is None, "список — не dict"
 
 
 def test_sources_list_builtin_first(client):

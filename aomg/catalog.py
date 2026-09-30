@@ -1,146 +1,142 @@
-"""Реестры-источники каталога: единый интерфейс RegistrySource.
+"""Встроенный html-адаптер каталога: neuraldeep.ru (ADR-0005).
 
-Источник 1: официальный registry.modelcontextprotocol.io (уже есть, registry.py)
-Источник 2: кастомные каталоги, пока neuraldeep.ru (российские сервисы).
-NeuralDeep — Next.js SPA без публичного JSON API: данные достаются из RSC-
-потока страницы /skills (self.__next_f.push чанки) или со страниц /mcp/<slug>
-(там есть команда установки и GitHub-репо).
+Источник каталога = адаптер, который умеет `search()` и `status()` —
+того же контракта, что у JsonSource и официального индекса. Раньше
+здесь жил второй, несовместимый контракт (`list_items`/`get_item`),
+а admin.py звал `search()` — на живой сборке это давало
+`AttributeError: 'NeuralDeepSource' object has no attribute 'search'`.
 
-Адаптер отдаёт те же RegistryEntry, UI разницы не знает.
+Карточки neuraldeep — установки вида `npx skillsbd add …`; агент
+получает готовую команду, поэтому карточка отдаёт `command`/`args`.
 """
 from __future__ import annotations
 
 import re
-from abc import ABC, abstractmethod
-from dataclasses import dataclass, field
 
 import httpx
 
-from .registry import RegistryEntry
-
-
-@dataclass
-class CatalogItem:
-    """Единая карточка каталога для UI (нейтральна к источнику)."""
-    source: str                 # "official" | "neuraldeep" | ...
-    name: str
-    kind: str                   # "mcp" | "skill" | "cli"
-    title: str = ""
-    description: str = ""
-    entry: RegistryEntry | None = None      # если конвертируется в сервер
-    install_hint: str = ""                  # напр. "npx skillsbd add ..."
-    repo_url: str = ""
-    ru_service: bool = False                # флаг для бейджа «РФ-сервис»
-
-
-class CatalogSource(ABC):
-    name: str = "base"
-
-    @abstractmethod
-    def list_items(self) -> list[CatalogItem]: ...
-
-    @abstractmethod
-    def get_item(self, slug: str) -> CatalogItem | None: ...
-
-
-# ---------- официальный реестр ----------
-
-class OfficialSource(CatalogSource):
-    name = "official"
-
-    def list_items(self, query: str = "", limit: int = 30):
-        from . import registry
-        return [CatalogItem(source=self.name, name=e.name, kind="mcp",
-                            title=e.title, description=e.description, entry=e)
-                for e in registry.search(query, limit)]
-
-    def get_item(self, slug: str):
-        items = self.list_items(slug, limit=5)
-        return items[0] if items else None
-
-
-# ---------- NeuralDeep ----------
-
 ND_BASE = "https://neuraldeep.ru"
+ND_TIMEOUT = 8.0
 
-# В RSC-потоке карточки лежат как escape-JSON. Достаём пары
+# В RSC-потоке Next.js карточки лежат как escape-JSON. Достаём пары
 # (тип, slug) из href-ов /mcp/<slug> и /skills/<slug>.
 _HREF = re.compile(rb'\\?"\/(mcp|skills)\\?\/([a-z0-9-]+)\\?"')
+_INSTALL = re.compile(r"npx\s+skillsbd\s+add\s+([A-Za-z0-9_@/.:-]+)")
+_REPO = re.compile(r'github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)')
 
 
-class NeuralDeepSource(CatalogSource):
+class NeuralDeepSource:
+    """Каталог neuraldeep.ru под общим контрактом источников.
+
+    `state` — результат последней попытки, а не константа: раньше
+    источник светился зелёным, оставаясь нерабочим.
+    """
+
     name = "neuraldeep"
 
-    def __init__(self, base: str = ND_BASE, timeout: float = 20.0):
+    def __init__(self, base: str = ND_BASE, timeout: float = ND_TIMEOUT,
+                 proxy: str | None = None):
         self.base = base
         self.timeout = timeout
+        self.proxy = proxy
+        self.state = "unprobed"
+        self.error: str | None = None
+        self._transport: httpx.BaseTransport | None = None
+        self._cards: list[dict] | None = None
+
+    # ---- сеть ----
 
     def _fetch(self, path: str) -> bytes:
-        r = httpx.get(f"{self.base}{path}", timeout=self.timeout,
-                      follow_redirects=True,
-                      headers={"User-Agent": "Mozilla/5.0 AOMG/0.1"})
-        r.raise_for_status()
-        return r.content
+        with httpx.Client(timeout=self.timeout, trust_env=False,
+                          proxy=self.proxy, follow_redirects=True,
+                          headers={"User-Agent": "Mozilla/5.0 AOMG/0.1"},
+                          **({"transport": self._transport}
+                             if self._transport is not None else {})) as c:
+            r = c.get(f"{self.base}{path}")
+            r.raise_for_status()
+            return r.content
 
-    def list_items(self) -> list[CatalogItem]:
+    def _load_slugs(self) -> list[tuple[str, str]]:
         html = self._fetch("/skills")
         seen: set[tuple[str, str]] = set()
-        items: list[CatalogItem] = []
+        out: list[tuple[str, str]] = []
         for kind, slug in _HREF.findall(html):
-            k = kind.decode()
-            s = slug.decode()
-            if (k, s) in seen or s in ("validator",):
+            k, s = kind.decode(), slug.decode()
+            if (k, s) in seen or s == "validator":
                 continue
             seen.add((k, s))
-            items.append(CatalogItem(source=self.name, name=s, kind=k))
-        return items
+            out.append((k, s))
+        return out
 
-    def get_item(self, slug: str) -> CatalogItem | None:
-        kind = "mcp" if "/mcp/" in slug or slug.startswith("mcp-") else "skills"
-        path = slug if slug.startswith("/") else f"/{kind}/{slug}"
+    # ---- контракт источника ----
+
+    def status(self) -> tuple:
+        return self.state, self.error
+
+    def search(self, query: str = "", limit: int = 50,
+               offset: int = 0) -> dict:
+        q = (query or "").strip().lower()
         try:
-            html = self._fetch(path).decode("utf-8", errors="replace")
-        except httpx.HTTPStatusError:
-            return None
+            if self._cards is None:
+                self._cards = self._build_cards()
+            self.state, self.error = "ok", None
+        except Exception as ex:
+            self.state = "unreachable"
+            self.error = f"{type(ex).__name__}: {ex}"[:150]
+            return {"items": [], "total": 0, "has_more": False}
+        matched = [c for c in self._cards
+                   if not q or q in c["name"].lower()
+                   or q in (c.get("title") or "").lower()
+                   or q in (c.get("description") or "").lower()]
+        total = len(matched)
+        page = matched[offset:offset + limit]
+        for card in page:
+            card.setdefault("source", self.name)
+        return {"items": page, "total": total,
+                "has_more": offset + len(page) < total}
+
+    def _build_cards(self) -> list[dict]:
+        cards: list[dict] = []
+        for kind, slug in self._load_slugs():
+            card = self._card_for(kind, slug)
+            if card:
+                cards.append(card)
+        return cards
+
+    def _card_for(self, kind: str, slug: str) -> dict | None:
+        """Карточка каталога. Для /mcp/* стараемся достать команду
+        установки; если страница недоступна — отдаём slug как имя."""
+        card = {"name": slug, "title": slug.replace("-", " ").title(),
+                "description": "", "kind": kind, "source": self.name,
+                "url": None, "command": None, "args": [],
+                "install": None, "form_fields": []}
+        try:
+            html = self._fetch(f"/{kind}/{slug}").decode("utf-8", "replace")
+        except Exception:
+            return card
+        m = _INSTALL.search(html)
+        if m:
+            # страница отдаёт `npx skillsbd add <pkg>`; в args обязаны
+            # попасть все три части, иначе панель подставит панели
+            # `npx -y Rusender/...` — команду, которой не существует
+            card["command"], card["args"] = "npx", ["-y", "skillsbd",
+                                                   "add", m.group(1)]
+            card["install"] = m.group(1)
+        rm = _REPO.search(html)
+        if rm:
+            card["repo_url"] = f"https://github.com/{rm.group(1)}"
         text = re.sub(r"<[^>]+>", "\n", html)
         lines = [l.strip() for l in text.splitlines() if l.strip()]
-        # описание: первый абзац после H1-слага
-        title = slug.rsplit("/", 1)[-1]
-        desc = ""
+        # Ищем заголовок в обеих формах: `slug` как есть (rusender-mcp)
+        # и с заменой дефисов на пробелы (rusender mcp) — на странице
+        # встречается любая из двух, и строгое сравнение молча оставляло
+        # карточку без описания.
+        variants = {slug.lower(), slug.replace("-", " ").lower()}
+        card["description"] = ""
         for i, l in enumerate(lines):
-            if title in l and i + 1 < len(lines):
-                desc = lines[i + 1][:400]
+            if l.lower() in variants and i + 1 < len(lines):
+                nxt = lines[i + 1]
+                if len(nxt) > 20 and "npx " not in nxt:
+                    card["description"] = nxt[:200]
                 break
-        m = re.search(r"npx skillsbd add [A-Za-z0-9_/.-]+", html)
-        repo = ""
-        rm = re.search(r'github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)', html)
-        if rm:
-            repo = f"https://github.com/{rm.group(1)}"
-        return CatalogItem(source=self.name, name=title, kind="mcp",
-                           title=title, description=desc,
-                           install_hint=m.group(0) if m else "",
-                           repo_url=repo, ru_service=True)
-
-
-SOURCES: dict[str, CatalogSource] = {
-    "official": OfficialSource(),
-    "neuraldeep": NeuralDeepSource(),
-}
-
-
-def catalog_search(query: str, sources: list[str] | None = None,
-                   limit: int = 20) -> list[CatalogItem]:
-    """Поиск по выбранным источникам (или по всем)."""
-    out: list[CatalogItem] = []
-    for name in sources or list(SOURCES):
-        src = SOURCES.get(name)
-        if src is None:
-            continue
-        try:
-            items = src.list_items() if hasattr(src, "list_items") else []
-        except Exception:
-            continue
-        q = query.lower()
-        out += [i for i in items
-                if q in i.name.lower() or q in i.description.lower()]
-    return out[:limit]
+        return card

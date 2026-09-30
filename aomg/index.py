@@ -44,17 +44,59 @@ class CatalogIndex:
         self.lock = threading.Lock()
         self.syncing = False
         self._sync_thread: threading.Thread | None = None
+        self._mem: tuple | None = None      # (mtime, data) — кэш load()
 
     # ---- диск ----
 
+    SENTINEL_BYTES = 160
+
+    def _sentinel(self) -> str:
+        """Первые байты файла — дешёвый «отпечаток» содержимого.
+
+        Ключ кэша по `mtime_ns`/`size` ненадёжен: две записи подряд
+        (слив реестра + тест, или две подряд заливки) на этой ФС получают
+        ОДИНАКОВЫЙ mtime_ns, и кэш отдавал протухшие данные. При этом
+        `synced_at` стоит в начале JSON, поэтому 160 байт достаточно,
+        чтобы заметить перезапись, не разбирая 2.4 МБ.
+        """
+        try:
+            with self.path.open("rb") as f:
+                return f.read(self.SENTINEL_BYTES).decode("utf-8", "replace")
+        except OSError:
+            return ""
+
     def load(self) -> dict | None:
+        """Разбор index.json с кэшем разбора.
+
+        Поиск в UI дёргается на каждый keystroke, а файл весит ~2.4 МБ
+        на 2779 записей — 33-48 мс чтения+парсинга на запрос (ADR-0005).
+        Кэш ключуется по (mtime_ns, size, sentinel): только чтение первых
+        160 байт на попытку, полный json.loads — при реальном изменении.
+        """
+        try:
+            st = self.path.stat()
+        except OSError:
+            self._mem = None
+            return None
+        key = (st.st_mtime_ns, st.st_size, self._sentinel())
+        if self._mem is not None and self._mem[0] == key:
+            return self._mem[1]
         try:
             data = json.loads(self.path.read_text(encoding="utf-8"))
             if isinstance(data, dict) and "servers" in data:
+                self._mem = (key, data)
                 return data
         except (OSError, ValueError):
             pass
+        self._mem = None
         return None
+
+    @property
+    def cached(self) -> bool:
+        return self._mem is not None
+
+    def invalidate(self) -> None:
+        self._mem = None
 
     def _save(self, rows: list[dict]) -> None:
         tmp = self.path.with_suffix(".json.tmp")
@@ -63,6 +105,7 @@ class CatalogIndex:
                        encoding="utf-8")
         import os
         os.replace(tmp, self.path)
+        self.invalidate()      # файл изменился — старый кэш неверен
 
     # ---- sync ----
 

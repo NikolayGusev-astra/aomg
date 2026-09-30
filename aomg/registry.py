@@ -12,6 +12,11 @@ import httpx
 
 REGISTRY_BASE = "https://registry.modelcontextprotocol.io"
 
+# Живой реестр отвечает от 0.5 до 45 секунд. Для UI потолок 3 с
+# (ADR-0005 I4): лучше «ничего не нашлось за 3 секунды», чем висящая
+# панель. Полный слив индекса (index.sync) живёт отдельно, с 60 с.
+REGISTRY_TIMEOUT = 3.0
+
 
 @dataclass
 class RegistryEntry:
@@ -76,10 +81,11 @@ def parse_server_entry(row: dict) -> RegistryEntry:
 
 
 def search(query: str, limit: int = 20,
-           timeout: float = 20.0) -> list[RegistryEntry]:
+           timeout: float = REGISTRY_TIMEOUT) -> list[RegistryEntry]:
+    """Синхронный поиск. Оставлен для CLI/скриптов и тестов."""
     params = {"search": query, "limit": str(limit)}
     out: list[RegistryEntry] = []
-    with httpx.Client(timeout=timeout) as c:
+    with httpx.Client(timeout=timeout, trust_env=False) as c:
         r = c.get(f"{REGISTRY_BASE}/v0/servers", params=params)
         r.raise_for_status()
         for row in r.json().get("servers", []):
@@ -87,4 +93,26 @@ def search(query: str, limit: int = 20,
                 out.append(parse_server_entry(row))
             except ValueError:
                 continue  # неактивные и пустые пропускаем молча
+    return out
+
+
+async def search_async(query: str, limit: int = 20,
+                       timeout: float = REGISTRY_TIMEOUT):
+    """Async-версия для HTTP-эндпоинтов панели (ADR-0005 I4).
+
+    Реестр отвечает от 0.5 до 45 секунд. Раньше панель звала блокирующий
+    `search()` с таймаутом 20 с из sync-эндпоинта — один зависший реестр
+    держал UI и пул потоков. Здесь потолок 3 с, и ошибка не поднимается:
+    вызывающий сам решает, что показать.
+    """
+    params = {"search": query, "limit": str(limit)}
+    out: list[RegistryEntry] = []
+    async with httpx.AsyncClient(timeout=timeout, trust_env=False) as c:
+        r = await c.get(f"{REGISTRY_BASE}/v0/servers", params=params)
+        r.raise_for_status()
+        for row in r.json().get("servers", []):
+            try:
+                out.append(parse_server_entry(row))
+            except ValueError:
+                continue
     return out

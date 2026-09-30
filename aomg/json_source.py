@@ -63,12 +63,17 @@ class JsonSource:
 
     name: str
 
-    def __init__(self, spec: CatalogSourceSpec, cache_dir: Path):
+    def __init__(self, spec: CatalogSourceSpec, cache_dir: Path,
+                 proxy: str | None = None):
         self.name = spec.name
         self.spec = spec
         self.cache_dir = cache_dir
         self.cache_path = cache_dir / f"catalog-cache-{spec.name}.json"
-        self.state = "ok"
+        # Прокси egress-группы источника (ADR-0005 I2). До этого
+        # `group` в конфиге был декоративным: корп-каталог за VPN
+        # не скачивался, а UI показывал «доступен».
+        self.proxy = proxy
+        self.state = "unprobed"
         self.error: str | None = None
         self._transport: httpx.BaseTransport | None = None  # для тестов
         self._mem: tuple[float, list[dict]] | None = None   # (ts, items)
@@ -91,9 +96,22 @@ class JsonSource:
 
     # ---- fetch + parse ----
 
+    def _client(self) -> httpx.Client:
+        """Клиент источника: egress-группа (ADR-0005 I2).
+
+        Тонкость httpx: переданный `transport` при непустом `proxy`
+        игнорируется — для прокси создаётся свой транспорт. Поэтому
+        инъекция транспорта (тесты) идёт через mounts, иначе тест на
+        прокси молча уходил бы в сеть.
+        """
+        if self._transport is not None:
+            return httpx.Client(timeout=TIMEOUT, trust_env=False,
+                                mounts={"all://": self._transport})
+        return httpx.Client(timeout=TIMEOUT, trust_env=False,
+                            proxy=self.proxy)
+
     def _fetch_network(self) -> object:
-        with httpx.Client(timeout=TIMEOUT, trust_env=False,
-                          transport=self._transport) as c:
+        with self._client() as c:
             r = c.get(self.spec.url, headers=self.spec.headers or {})
             r.raise_for_status()
             return r.json()
@@ -135,19 +153,32 @@ class JsonSource:
         self._save_cache(items)
         return FetchResult(items=items, state="ok")
 
-    def search(self, query: str, limit: int = 20) -> list[dict]:
-        """Поиск по последнему известному набору карточек (кэш/сеть)."""
+    def status(self) -> tuple:
+        """(state, error) — результат последней реальной попытки.
+
+        До первой попытки честное `unprobed`, а не `ok`: зелёный свет
+        у непроверенного источника — тот самый баг из аудита.
+        """
+        return self.state, self.error
+
+    def search(self, query: str = "", limit: int = 50,
+               offset: int = 0) -> dict:
+        """Поиск по последнему известному набору карточек (кэш/сеть).
+
+        Возвращает {items, total, has_more} — общий контракт источников
+        каталога (ADR-0005). offset даёт срез, а не первые N.
+        """
         res = self.fetch()
         q = (query or "").strip().lower()
-        out: list[dict] = []
+        matched: list[dict] = []
         for card in res.items:
             if not q or q in card["name"].lower() \
                     or q in (card.get("title") or "").lower() \
                     or q in (card.get("description") or "").lower():
-                out.append(card)
-            if len(out) >= limit:
-                break
-        # помечаем источник в карточках
-        for card in out:
+                matched.append(card)
+        total = len(matched)
+        page = matched[offset:offset + limit]
+        for card in page:
             card.setdefault("source", self.name)
-        return out
+        return {"items": page, "total": total,
+                "has_more": offset + len(page) < total}
