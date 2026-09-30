@@ -51,7 +51,12 @@ class Config:
     def egress_for(self, server: ServerSpec) -> str | None:
         if server.proxy is not None:
             return server.proxy
-        g = self.groups.get(server.group)
+        return self.egress_for_group(server.group)
+
+    def egress_for_group(self, group: str) -> str | None:
+        """Прокси группы. Тот же контракт нужен источникам каталога:
+        они выбирают маршрут по имени группы, а не по ServerSpec."""
+        g = self.groups.get(group)
         return g.proxy if g else None
 
 

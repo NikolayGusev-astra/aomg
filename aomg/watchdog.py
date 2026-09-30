@@ -12,7 +12,6 @@ import time
 import httpx
 
 from .config import Config
-from .health import Health
 from .supervisor import Supervisor
 
 
@@ -65,28 +64,45 @@ def probe(base: str, name: str, proxy: str | None,
         return "down", 0, f"{type(e).__name__}: {e}"[:200]
 
 
+def make_prober(cfg: Config, base: str):
+    """Замыкание probe(name) -> (state, tools, error) для Supervisor."""
+    def _probe(name: str):
+        spec = cfg.servers.get(name)
+        proxy = cfg.egress_for(spec) if spec else None
+        return probe(base, name, proxy)
+    return _probe
+
+
+def watch_once(supervisor: Supervisor, base: str | None = None) -> None:
+    """Один проход: проба всех серверов + политика для упавших детей."""
+    base = base or f"http://127.0.0.1:{supervisor.cfg.gateway_port}"
+    supervisor.watch_tick(time.time(),
+                          probe=make_prober(supervisor.cfg, base))
+
+
 def watch_loop(cfg: Config, supervisor: Supervisor,
-               healths: dict[str, Health], interval: float = 30.0,
-               base: str | None = None) -> None:
+               interval: float = 30.0, base: str | None = None) -> None:
+    """Наблюдатель, а не политик.
+
+    Перезапуск и backoff живут в Supervisor (ADR-0004); владение
+    состоянием — тоже там (ADR-0003). Здесь только проба и передача
+    фактов, поэтому цикл не может умереть от одного сервера, которого
+    нет в реестре, и не падает целиком на исключении в проходе.
+    """
     base = base or f"http://127.0.0.1:{cfg.gateway_port}"
     while True:
-        for name, spec in cfg.servers.items():
-            h = healths[name]
-            if spec.kind == "stdio" and not supervisor.managed[name].alive():
-                h.record("reconnecting", ts=time.time(),
-                         error="child dead, restarting")
-                supervisor.restart(name)
-                continue
-            state, tools, err = probe(base, name, cfg.egress_for(spec))
-            h.record(state, tools=tools, error=err, ts=time.time())
+        try:
+            watch_once(supervisor, base)
+        except Exception:
+            pass
         time.sleep(interval)
 
 
 def start_watchdog(cfg: Config, supervisor: Supervisor,
-                   healths: dict[str, Health], interval: float = 30.0,
+                   interval: float = 30.0,
                    base: str | None = None) -> threading.Thread:
     t = threading.Thread(
         target=watch_loop,
-        args=(cfg, supervisor, healths, interval, base), daemon=True)
+        args=(cfg, supervisor, interval, base), daemon=True)
     t.start()
     return t

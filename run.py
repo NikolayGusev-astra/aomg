@@ -16,9 +16,11 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 from aomg.config import load_config
 from aomg.gateway import create_app, serve_in_thread
-from aomg.health import Health
+from aomg.port import PortUnavailable, resolve_gateway_port
 from aomg.supervisor import Supervisor
 from aomg.watchdog import start_watchdog
+
+DEFAULT_PORT = 9300
 
 
 def _app_dir() -> Path:
@@ -28,6 +30,23 @@ def _app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
     return Path(__file__).resolve().parent
+
+
+def write_default_config(cfg_path: Path, gateway_port: int) -> None:
+    """Первый запуск: чистый конфиг с ПРОВЕРЕННЫМ портом.
+
+    Демо-серверов здесь нет намеренно: пример, который не запускается
+    на машине юзера, превращается в рестарт-цикл (ADR-0004/0006).
+    Порт сюда пишется фактический — тот, что resolve_gateway_port
+    проверил на свободный, а не константа 9300.
+    """
+    cfg_path.write_text(
+        "# AOMG config — серверы добавляются через панель\n"
+        f"# http://127.0.0.1:{gateway_port}/admin\n"
+        f"gateway_port: {gateway_port}\n\n"
+        "groups:\n"
+        '  direct: {name: "Напрямую", proxy: null}\n',
+        encoding="utf-8")
 
 
 def main() -> int:
@@ -52,20 +71,60 @@ def main() -> int:
     cfg_path = (Path(args.config) if args.config else Path(
         os.environ.get("AOMG_CONFIG",
                        _app_dir() / "config.yaml")))
-    cfg = load_config(cfg_path)
-    healths = {n: Health() for n in cfg.servers}
 
+    # Порт гейтвея (ADR-0006). Различаем два случая: порт НЕ задан
+    # пользователем — подставляем свободный и пишем факт; задан и
+    # занят — диагностика и код выхода 2. Молча уводить гейтвей на
+    # другой адрес нельзя: агент настроен на этот URL из конфига.
+    port = DEFAULT_PORT
+    explicit_port = False
+    if cfg_path.exists():
+        try:
+            import yaml
+            raw = yaml.safe_load(cfg_path.read_text(
+                encoding="utf-8")) or {}
+            if raw.get("gateway_port"):
+                port = int(raw["gateway_port"])
+                explicit_port = True
+        except Exception:
+            explicit_port = False
+    try:
+        port = resolve_gateway_port(port, explicit=explicit_port)
+    except PortUnavailable as e:
+        print(f"[aomg] {e}", flush=True)
+        return 2
+    if not explicit_port:
+        print(f"[aomg] gateway port {port}", flush=True)
+
+    if not cfg_path.exists():
+        # Первый запуск: чистый конфиг БЕЗ демо-серверов. Пример из
+        # документации, который не запускается на машине юзера, хуже
+        # отсутствия примера: AOMG сам поднимает и рестартует stdio-детей,
+        # поэтому мёртвый демо превращается в вечный рестарт-цикл.
+        write_default_config(cfg_path, gateway_port=port)
+        print(f"[aomg] created default config: {cfg_path}", flush=True)
+
+    cfg = load_config(cfg_path)
+    cfg.gateway_port = port
+
+    # Health заводит Supervisor, а не run.py: раньше словарь создавался
+    # здесь, а сервер, добавленный в панели, в него не попадал —
+    # и watchdog падал на KeyError (ADR-0003).
     sup = Supervisor(cfg)
     sup.start_all()
+    sup.collect_secrets()
 
     from aomg.admin import register_admin
 
     def configure(app):
-        register_admin(app, cfg, sup, healths, cfg_path,
+        register_admin(app, cfg, sup, cfg_path,
                        restart_watchdog=lambda: None)
 
-    gw_thread = serve_in_thread(cfg, sup, healths, configure=configure)
-    start_watchdog(cfg, sup, healths, interval=30.0)
+    gw_thread = serve_in_thread(cfg, sup, configure=configure)
+    # Интервал watchdog настраивается: e2e обязан проверять рестарт
+    # ребёнка за секунды, а не за полминуты (ADR-0004).
+    interval = float(os.environ.get("AOMG_WATCH_INTERVAL") or 30.0)
+    start_watchdog(cfg, sup, interval=interval)
 
     # прогрев каталога: индекс реестра должен быть свежим к открытию админки
     from aomg.index import CatalogIndex, warm
@@ -83,7 +142,7 @@ def main() -> int:
         os._exit(0)
 
     signal.signal(signal.SIGTERM, lambda *_: on_quit())
-    run_tray(healths, sup, on_quit, gateway_port=cfg.gateway_port)
+    run_tray(sup, on_quit, gateway_port=cfg.gateway_port)
     return 0
 
 

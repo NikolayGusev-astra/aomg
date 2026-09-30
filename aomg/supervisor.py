@@ -1,17 +1,28 @@
-"""Супервизор: stdio-дети через mcp-proxy (один прокси-процесс на сервер).
+"""Супервизор: stdio-дети через mcp-proxy + ВЛАДЕНИЕ рантайм-состоянием.
 
-Каждый stdio-сервер получает свой mcp-proxy на свободном порту 127.0.0.1;
-прокси сам спавнит и держит ребёнка. Смерть ребёнка = отказ handshake —
-это ловит watchdog, рестарт = перезапуск прокси.
+Два решения живут здесь, оба из ADR:
 
-Логи: stdout/stderr каждого mcp-proxy (и ребёнка) пишутся в файл
+* **ADR-0003 (runtime-реестр).** `Supervisor` — единственный владелец
+  `ManagedServer` и `Health`. Словарь `healths` больше не передаётся
+  четырём модулям как параметр: добавить сервер «наполовину» нельзя,
+  потому что единственная точка мутации — `add`/`remove` под локом.
+
+* **ADR-0004 (политика перезапуска).** Смерть ребёнка ≠ повод для
+  бесконечного респауна. Здесь живут backoff и circuit breaker; watchdog
+  только сообщает факт. Корневая причина респауна из лога установленной
+  сборки — `mcp 2.x` вместо `mcp<2` в пакете ребёнка.
+
+Логи: stdout/stderr каждого mcp-proxy (и ребёнка) пишутся в
 <logs_dir>/<name>.log (ротация: при превышении LOG_MAX байтов файл
 переименовывается в <name>.log.old). logs_dir: <app_dir>/logs
 (frozen) или ./logs; путь настраивается через set_logs_dir().
+Перед отдачей в API лог проходит redact_secrets() — ключи из конфига
+не должны утекать в /health (ADR-0006).
 """
 from __future__ import annotations
 
 import os
+import re
 import socket
 import subprocess
 import sys
@@ -27,11 +38,25 @@ MCP_PROXY_PORT_BASE = 9400
 
 LOG_MAX = 512 * 1024          # ротация одного лог-файла
 LOG_TAIL = 400                # хвост ошибки для /health
+REDACTED = "***"
+
+# ADR-0004: паузы между авторестартами, секунды. Первый — сразу (ребёнка
+# убили извне, пользователь не должен ждать), дальше с потолком 60 с.
+RESTART_BACKOFF = (0, 5, 15, 30, 60)
+MAX_FAILS = 3                  # после — разомкнуть автомат, не рестартить
+
 _logs_dir: Path | None = None
 
+# Счётчик спавнов — только для тестов (ADR-0004 I1): production-код его
+# не читает, тесты проверяют конечность рестарт-цикла.
+spawn_counter: list = []
 
-def set_logs_dir(path: Path) -> None:
+
+def set_logs_dir(path: Path | None) -> None:
     global _logs_dir
+    if path is None:
+        _logs_dir = None
+        return
     _logs_dir = path
     path.mkdir(parents=True, exist_ok=True)
 
@@ -68,8 +93,41 @@ def _open_log(name: str):
         return subprocess.DEVNULL
 
 
-def last_error(name: str) -> str | None:
-    """Хвост лога сервера — для /health и панели."""
+_SECRET_PLACEHOLDER = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
+
+
+def collect_secret_values(env: dict, headers: dict,
+                          extra: list | None = None) -> list[str]:
+    """Значения, которые нельзя показывать в логах и API.
+
+    Неразвёрнутые `${VAR}` плейсхолдеры исключены: иначе redactor
+    затёр бы текст вида «переменная ${GITHUB_PAT} не задана».
+    """
+    out: list[str] = []
+    for src in (env or {}, headers or {}):
+        for v in src.values():
+            if isinstance(v, str) and len(v) >= 6 \
+                    and not _SECRET_PLACEHOLDER.match(v.strip()):
+                out.append(v)
+    for v in extra or []:
+        if isinstance(v, str) and len(v) >= 6:
+            out.append(v)
+    return out
+
+
+def redact_secrets(text: str | None, secrets: list | None) -> str:
+    """Вырезать значения секретов из произвольного текста (лог, URL)."""
+    if not text:
+        return ""
+    out = text
+    for s in secrets or []:
+        if s and len(s) >= 6:
+            out = out.replace(s, REDACTED)
+    return out
+
+
+def last_error(name: str, secrets: list | None = None) -> str | None:
+    """Хвост лога сервера — для /health и панели, с маскированием."""
     for p in (logs_dir() / f"{name}.log",
               logs_dir() / f"{name}.log.old"):
         try:
@@ -77,7 +135,8 @@ def last_error(name: str) -> str | None:
                 text = p.read_text(encoding="utf-8", errors="replace")
                 lines = [l for l in text.strip().splitlines() if l.strip()]
                 if lines:
-                    return "\n".join(lines[-5:])[:LOG_TAIL]
+                    tail = redact_secrets("\n".join(lines[-5:]), secrets)
+                    return tail[:LOG_TAIL]
         except OSError:
             continue
     return None
@@ -87,6 +146,35 @@ def _free_port() -> int:
     with socket.socket() as s:
         s.bind(("127.0.0.1", 0))
         return s.getsockname()[1]
+
+
+def which_command(cmd: str) -> str | None:
+    """Аналог shutil.which, умеющий .exe/.bat/.cmd (Windows)."""
+    from shutil import which
+    found = which(cmd)
+    if found:
+        return found
+    for ext in (".exe", ".bat", ".cmd", ".com"):
+        found = which(cmd + ext)
+        if found:
+            return found
+    return None
+
+
+def command_missing(spec: ServerSpec) -> bool:
+    """Команда не найдена ни в PATH, ни как существующий путь.
+
+    Ловит класс отказа «бинаря нет» до спавна: иначе mcp-proxy
+    стартует, падает и порождает рестарт-цикл ради заведомо мёртвой
+    команды. Ответ ложный для npm/uvx-обёрток (npx, uvx, node, python) —
+    они резолвятся в shell, поэтому проверяем только исполняемые имена.
+    """
+    cmd = (spec.command or "").strip()
+    if not cmd:
+        return True
+    if any(sep in cmd for sep in ("\\", "/")):
+        return not Path(cmd).exists()
+    return which_command(cmd) is None
 
 
 class ManagedServer:
@@ -101,6 +189,14 @@ class ManagedServer:
 
     def start(self, cfg: Config) -> None:
         if self.spec.kind != "stdio" or (self.proc and self.proc.poll() is None):
+            return
+        if command_missing(self.spec):
+            # Не спавним заведомо мёртвую команду: один раз — и down с
+            # внятной причиной, а не рестарт-цикл (ADR-0004).
+            self.health.record(
+                "down",
+                error=f"команда не найдена: {self.spec.command}",
+                ts=time.time())
             return
         env = {**os.environ, **self.spec.env}
         egress = cfg.egress_for(self.spec)
@@ -151,7 +247,10 @@ class ManagedServer:
                 stdin=subprocess.DEVNULL, stdout=fh,
                 stderr=subprocess.STDOUT, env=env,
                 creationflags=subprocess.CREATE_NO_WINDOW)
+            spawn_counter.append(self.spec.name)
+            self.spawned_at = time.time()
             self.health.pid = self.proc.pid
+            self.health.record("reconnecting", ts=time.time())
         except FileNotFoundError as e:
             self.health.record("down", error=str(e), ts=time.time())
 
@@ -176,44 +275,128 @@ class ManagedServer:
 
 
 class Supervisor:
+    """Владелец рантайм-состояния: процессы + Health + рестарт-политика.
+
+    ADR-0003: `add`/`remove` — единственные точки мутации, обе под
+    `_lock`. Всё остальное читает через `health()`/`snapshot()`, поэтому
+    отсутствие записи — это `None`, а не KeyError.
+
+    ADR-0004: `watch_tick()` — один шаг политики для одного сервера.
+    Рестарт не бесконечен: `MAX_FAILS` попыток, потом `down` с причиной.
+    """
+
     def __init__(self, cfg: Config):
         self.cfg = cfg
         self.managed: dict[str, ManagedServer] = {}
+        self.healths: dict[str, Health] = {}
+        self.fails: dict[str, int] = {}
+        self.next_allowed: dict[str, float] = {}
+        self.secrets: list[str] = []
         self._lock = threading.Lock()
 
-    def start_all(self) -> None:
-        for name, spec in self.cfg.servers.items():
-            h = Health()
-            self.managed[name] = ManagedServer(spec, h)
-            if spec.kind == "stdio":
-                self.managed[name].start(self.cfg)
+    # ---- секреты (ADR-0006: маскирование в API) ----
 
-    def ensure(self, name: str) -> None:
-        """Создать ManagedServer после добавления в cfg (config уже обновлён)."""
+    def collect_secrets(self) -> list[str]:
+        out: list[str] = []
+        for spec in self.cfg.servers.values():
+            out += collect_secret_values(spec.env, spec.headers)
+        self.secrets = out
+        return out
+
+    def set_secrets(self, values) -> None:
+        self.secrets = [v for v in values if isinstance(v, str) and v]
+
+    def last_error(self, name: str) -> str | None:
+        """Хвост лога с маскированием секретов (не модульная функция:
+        модульная last_error() требует явного списка секретов)."""
+        return last_error(name, self.secrets)
+
+    # ---- мутации: единственные точки (ADR-0003 I1) ----
+
+    def add(self, name: str, spec: ServerSpec | None = None) -> Health:
+        """Создать/обновить сервер: cfg.servers + Health + ManagedServer
+        атомарно, под одним локом (ADR-0003 I1)."""
+        spec = spec if spec is not None else self.cfg.servers.get(name)
+        if spec is None:
+            raise KeyError(name)
         with self._lock:
-            spec = self.cfg.servers.get(name)
-            if spec and name not in self.managed:
-                h = Health()
-                self.managed[name] = ManagedServer(spec, h)
-                if spec.kind == "stdio":
-                    self.managed[name].start(self.cfg)
+            self.cfg.servers[name] = spec
+            h = self.healths.get(name)
+            if h is None:
+                h = self.healths[name] = Health()
+            m = self.managed.get(name)
+            if m is None:
+                m = self.managed[name] = ManagedServer(spec, h)
+            else:
+                m.spec = spec
+                m.health = h
+        if spec.kind == "stdio":
+            m.start(self.cfg)
+        return h
 
     def remove(self, name: str) -> None:
+        """Снять сервер из рантайма и из конфига (панель «Удалить»)."""
         with self._lock:
             m = self.managed.pop(name, None)
             if m:
                 m.stop()
+            self.healths.pop(name, None)
+            self.fails.pop(name, None)
+            self.next_allowed.pop(name, None)
+            self.cfg.servers.pop(name, None)
 
-    def restart(self, name: str) -> None:
+    def restart(self, name: str, manual: bool = False) -> None:
+        """Перезапуск. manual=True — кнопка панели: сбрасывает цепь
+        неудач и замыкает разомкнутый автомат (ADR-0004 I3)."""
         with self._lock:
             m = self.managed.get(name)
-            if m and m.spec.kind == "stdio":
-                m.stop()
-                m.start(self.cfg)
+            if m is None or m.spec.kind != "stdio":
+                return
+            if manual:
+                self.fails[name] = 0
+                self.next_allowed[name] = 0.0
+            m.stop()
+        m.start(self.cfg)
+        if manual:
+            m.health.record("reconnecting",
+                            error="перезапуск вручную", ts=time.time())
+
+    def start_all(self) -> None:
+        for name in list(self.cfg.servers):
+            self.add(name)
+
+    def ensure(self, name: str) -> Health | None:
+        """Создать, если ещё нет; иначе вернуть существующий Health."""
+        if name in self.managed:
+            return self.healths.get(name)
+        if name not in self.cfg.servers:
+            return None
+        return self.add(name)
 
     def stop_all(self) -> None:
-        for m in self.managed.values():
-            m.stop()
+        for name in list(self.managed):
+            m = self.managed.get(name)
+            if m:
+                m.stop()
+
+    # ---- чтение (ADR-0003 I2: без KeyError) ----
+
+    def health(self, name: str) -> Health | None:
+        return self.healths.get(name)
+
+    def snapshot(self) -> list:
+        """Согласованный срез (name, Health) под локом, в порядке конфига.
+
+        `list(...)` обязателен: пока панель добавляет сервер, обход
+        внешнего словаря без копии даёт `RuntimeError: dictionary changed
+        size during iteration` — watchdog на этом молча умирал.
+        """
+        with self._lock:
+            servers = dict(self.cfg.servers)
+            healths = dict(self.healths)
+        names = [n for n in servers if n in healths]
+        extra = [n for n in healths if n not in servers]
+        return [(n, healths[n]) for n in names + extra]
 
     def upstream_for(self, name: str) -> str | None:
         m = self.managed.get(name)
@@ -223,3 +406,82 @@ class Supervisor:
             return None
         spec = self.cfg.servers.get(name)
         return spec.url if spec else None
+
+    # ---- политика перезапуска (ADR-0004) ----
+
+    def backoff_for(self, name: str) -> float:
+        """Пауза перед N-й попыткой рестарта (N = число неудач)."""
+        n = self.fails.get(name, 0)
+        return float(RESTART_BACKOFF[min(max(n, 0), len(RESTART_BACKOFF) - 1)])
+
+    def note_alive(self, name: str, ts: float | None = None) -> None:
+        """Сервер ответил — цепь неудач обнуляется и статус становится
+        `ok` (ADR-0004 I2). Вызывается ровно тогда, когда проба дала ok."""
+        self.fails[name] = 0
+        self.next_allowed[name] = 0.0
+        h = self.healths.get(name)
+        if h is not None:
+            h.record("ok", ts=ts if ts is not None else time.time())
+
+    def record_failure(self, name: str, ts: float,
+                       reason: str | None = None) -> str:
+        """Один шаг политики для упавшего stdio-сервера.
+
+        Возвращает новое состояние. Рестарт — не более MAX_FAILS раз,
+        дальше автомат разомкнут: состояние `down` с причиной из лога,
+        ручной рестарт из панели возвращает сервер в работу.
+        """
+        h = self.healths.get(name)
+        if h is None:
+            return "unknown"
+        n = self.fails.get(name, 0) + 1
+        self.fails[name] = n
+        tail = reason or self.last_error(name) or ""
+        tail = " ".join(tail.split())[:200]
+
+        if n > MAX_FAILS:
+            h.record("down", ts=ts,
+                     error=f"авторестарт остановлен после {MAX_FAILS} попыток. "
+                           f"Причина: {tail or 'см. лог сервера'}")
+            return "down"
+
+        if ts < self.next_allowed.get(name, 0.0):
+            h.record("reconnecting", ts=ts,
+                     error=f"пауза перед рестартом "
+                           f"{self.next_allowed[name] - ts:.0f} с")
+            return "reconnecting"
+
+        self.next_allowed[name] = ts + self.backoff_for(name)
+        self.restart(name)
+        if n >= MAX_FAILS:
+            h.record("down", ts=ts,
+                     error=f"{n} попыток, авторестарт прекращён. "
+                           f"Причина: {tail or 'см. лог сервера'}")
+            return "down"
+        h.record("reconnecting", ts=ts, error=tail or "ребёнок умер, рестарт")
+        return "reconnecting"
+
+    def watch_tick(self, ts: float, probe=None) -> None:
+        """Один проход политики по всем серверам.
+
+        `probe(name) -> (state, tools, error)`; None — только контроль
+        процессов (используется в тестах и в первом проходе). Сервер
+        без Health пропускается, а не роняет проход: рассинхрон конфига
+        не должен убивать watchdog (ADR-0003).
+        """
+        # копия списка: панель может добавить сервер прямо во время
+        # прохода, и обход dict без копии даёт RuntimeError
+        for name, spec in list(self.cfg.servers.items()):
+            h = self.healths.get(name)
+            if h is None:
+                continue
+            m = self.managed.get(name)
+            if spec.kind == "stdio" and m is not None and not m.alive():
+                self.record_failure(name, ts, None)
+                continue
+            if probe is None:
+                continue
+            state, tools, err = probe(name)
+            if state == "ok":
+                self.note_alive(name)
+            h.record(state, tools=tools, error=err, ts=ts)
