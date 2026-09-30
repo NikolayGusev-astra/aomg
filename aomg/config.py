@@ -30,10 +30,23 @@ class ServerSpec:
 
 
 @dataclass
+class CatalogSourceSpec:
+    """Источник каталога (ADR-0002). Встроенные (neuraldeep) — без type/url;
+    пользовательские — type=json + url, egress = группа `group`."""
+    name: str
+    type: str = ""                # "" | "json"
+    url: str = ""
+    group: str = "direct"
+    headers: dict[str, str] = field(default_factory=dict)
+    hidden: bool = False
+
+
+@dataclass
 class Config:
     gateway_port: int = 9300
     groups: dict[str, Group] = field(default_factory=dict)
     servers: dict[str, ServerSpec] = field(default_factory=dict)
+    catalog_sources: dict[str, CatalogSourceSpec] = field(default_factory=dict)
 
     def egress_for(self, server: ServerSpec) -> str | None:
         if server.proxy is not None:
@@ -84,6 +97,20 @@ def load_config(path: Path) -> Config:
             env=env, url=s.get("url"),
             headers=headers, proxy=s.get("proxy"),
             pinned_version=s.get("pinned_version"))
+    for cname, s in (raw.get("catalog_sources") or {}).items():
+        if not isinstance(s, dict):
+            continue
+        spec = CatalogSourceSpec(
+            name=cname, type=s.get("type", ""),
+            url=s.get("url", ""), group=s.get("group", "direct"),
+            headers={k: _expand(v) if isinstance(v, str) else v
+                     for k, v in (s.get("headers") or {}).items()},
+            hidden=bool(s.get("hidden", False)))
+        # неизвестное имя без type — warning и пропуск (не роняем конфиг)
+        if not spec.type and cname != "neuraldeep":
+            print(f"warning: catalog source '{cname}' has no type, skipped")
+            continue
+        cfg.catalog_sources[cname] = spec
     return cfg
 
 
