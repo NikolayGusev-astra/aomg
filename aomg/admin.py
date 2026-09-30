@@ -281,8 +281,18 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                 out["notice"] = "Показано из реестра напрямую " \
                                 "(локальный индекс обновляется в фоне)"
             else:
-                out["notice"] = "Реестр MCP недоступен, локальный индекс " \
-                                "пуст — попробуйте позже"
+                # Живой реестр ничего не вернул И локальный индекс пуст —
+                # только тогда индекс действительно не наполнен. Раньше
+                # это сообщение показывалось при любом промахе, хотя
+                # реестр отвечал 200, а индекс лежал на диске: диагноз
+                # уводил в сторону (ADR-0005, truthful status).
+                src = app.state.catalog_sources[src_name]
+                if src._idx.load():
+                    out["notice"] = f"По запросу «{query}» ничего не " \
+                                    f"нашлось в реестре MCP"
+                else:
+                    out["notice"] = "Реестр MCP недоступен, локальный " \
+                                    "индекс пуст — попробуйте позже"
         elif src_name == "official" and not result["items"] \
                 and not query and not result.get("notice"):
             out["notice"] = "Каталог загружается (первая синхронизация " \

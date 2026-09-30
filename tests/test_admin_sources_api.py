@@ -109,6 +109,45 @@ def test_json_body_helper_rejects_non_dict():
         _json_body(_Req([1, 2]))) is None, "список — не dict"
 
 
+def test_notice_does_not_claim_registry_down_when_index_is_full(client):
+    """Промах по запросу при живом индексе — это «не найдено».
+
+    Найдено на установленной сборке: реестр отвечал 200, индекс лежал
+    на диске (2791 запись), а UI писал «Реестр MCP недоступен, локальный
+    индекс пуст». Сообщение врало про оба источника сразу и уводило
+    в ложный диагноз.
+    """
+    # индекс заполнен — иначе проверяем не тот случай
+    idx = client.app.state.catalog_sources["official"]._idx
+    idx._save([{"server": {"name": "ac.test/filesystem",
+                           "description": "Filesystem MCP server",
+                           "version": "1.0.0"},
+                "_meta": {"io.modelcontextprotocol.registry/official": {
+                    "status": "active"}}}])
+    idx.invalidate()
+    r = client.get("/admin/api/catalog",
+                   params={"query": "абракадабранесуществующее"})
+    d = r.json()
+    assert d["state"] == "ok", d
+    notice = d.get("notice") or ""
+    assert "недоступен" not in notice.lower(), \
+        f"сообщение врёт при живом реестре: {notice!r}"
+    assert "индекс пуст" not in notice.lower(), \
+        f"сообщение врёт про пустой индекс: {notice!r}"
+
+
+def test_notice_reports_registry_problem_only_when_index_is_empty(client):
+    """Обратная сторона: пустой индекс — честное «реестр недоступен»."""
+    client.app.state.catalog_sources["official"]._idx.path = (
+        client.app.state.catalog_sources["official"]._idx.path
+        .with_name("отсутствует.json"))
+    client.app.state.catalog_sources["official"]._idx.invalidate()
+    r = client.get("/admin/api/catalog", params={"query": "blender"})
+    notice = r.json().get("notice") or ""
+    assert "недоступен" in notice.lower(), \
+        f"при пустом индексе сообщение должно быть честным: {notice!r}"
+
+
 def test_sources_list_builtin_first(client):
     data = client.get("/admin/api/catalog/sources").json()["sources"]
     names = [s["name"] for s in data]
