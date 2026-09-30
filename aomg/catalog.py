@@ -11,6 +11,7 @@
 """
 from __future__ import annotations
 
+import json
 import re
 
 import httpx
@@ -20,7 +21,11 @@ ND_TIMEOUT = 8.0
 
 # В RSC-потоке Next.js карточки лежат как escape-JSON. Достаём пары
 # (тип, slug) из href-ов /mcp/<slug> и /skills/<slug>.
-_HREF = re.compile(rb'\\?"\/(mcp|skills)\\?\/([a-z0-9-]+)\\?"')
+# Раздел на сайте бывает `mcp`, `skill` и `cli`; `skills` — тоже
+# встречается. Раньше здесь стояло только `mcp|skills`, и 7 из 9 ссылок
+# (`/skill/...`, `/cli/...`) не проходили: каталог показывал 2 карточки
+# вместо всех.
+_HREF = re.compile(rb'\\?"\/(mcp|skills?|cli)\\?\/([a-z0-9-]+)\\?"')
 _INSTALL = re.compile(r"npx\s+skillsbd\s+add\s+([A-Za-z0-9_@/.:-]+)")
 _REPO = re.compile(r'github\.com/([A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+)')
 
@@ -55,6 +60,44 @@ class NeuralDeepSource:
             r = c.get(f"{self.base}{path}")
             r.raise_for_status()
             return r.content
+
+    # ---- разбор страницы ----
+
+    # Полные записи лежат в RSC-потоке Next.js как escape-JSON:
+    # [1,"[{\"name\":...,\"owner\":...,\"repo\":...,\"description\":...,
+    #      \"type\":\"skill\",\"installs\":15}]"]
+    # Раньше каталог брал только href-ы вида /<kind>/<slug>, а таких
+    # ссылок на странице единицы — остальное терялось, и панель
+    # показывала два сервера вместо всего списка.
+    _REC = re.compile(
+        r'\\"name\\":\\"(?P<name>[^"\\]{1,80})\\",'
+        r'\\"owner\\":\\"(?P<owner>[^"\\]{0,80})\\",'
+        r'\\"repo\\":\\"(?P<repo>[^"\\]{0,80})\\",'
+        r'\\"description\\":(?:\\"(?P<desc>[^"\\]*)\\"|null),'
+        r'\\"installs\\":(?P<installs>\d+),'
+        r'.*?\\"type\\":\\"(?P<type>[a-z]+)\\"',
+        re.S)
+    _KIND_PATH = {"mcp": "mcp", "skill": "skill", "cli": "cli",
+                  "skills": "skills"}
+
+    def _load_rsc_records(self) -> list[dict]:
+        """Записи каталога из RSC-потока страницы."""
+        html = self._fetch("/skills").decode("utf-8", "replace")
+        out: list[dict] = []
+        seen: set[str] = set()
+        for m in self._REC.finditer(html):
+            name = m.group("name")
+            if name in seen:
+                continue
+            seen.add(name)
+            # описание приходит уже без экранирования: класс в регулярке
+            # не пропускает обратный слэш, поэтому внутри строки его нет
+            desc = (m.group("desc") or "").replace("\\n", " ").strip()
+            out.append({"name": name, "owner": m.group("owner"),
+                        "repo": m.group("repo"), "description": desc,
+                        "installs": int(m.group("installs")),
+                        "type": m.group("type")})
+        return out
 
     def _load_slugs(self) -> list[tuple[str, str]]:
         html = self._fetch("/skills")
@@ -96,12 +139,36 @@ class NeuralDeepSource:
                 "has_more": offset + len(page) < total}
 
     def _build_cards(self) -> list[dict]:
-        cards: list[dict] = []
-        for kind, slug in self._load_slugs():
-            card = self._card_for(kind, slug)
-            if card:
-                cards.append(card)
-        return cards
+        """Карточки из RSC-записей; href-ы — только дополнение.
+
+        Основной источник — поток с полными данными. Если он по какой-то
+        причине пуст (разметка сайта изменилась), откатываемся на
+        прежнее поведение по href, чтобы каталог не остался пустым.
+        """
+        records = self._load_rsc_records()
+        if records:
+            return [self._card_from_record(r) for r in records]
+        return [c for c in (self._card_for(k, s)
+                            for k, s in self._load_slugs()) if c]
+
+    def _card_from_record(self, rec: dict) -> dict:
+        """Карточка из записи RSC-потока — без похода на страницу.
+
+        Раньше на каждую карточку делался отдельный HTTP-запрос, хотя
+        репозиторий и описание уже лежат в том же потоке.
+        """
+        name, owner, repo = rec["name"], rec["owner"], rec["repo"]
+        pkg = f"{owner}/{repo}" if owner and repo else name
+        return {"name": name,
+                "title": rec["description"].split(".")[0][:80] or name,
+                "description": rec["description"],
+                "kind": rec["type"], "source": self.name,
+                "url": None,
+                "command": "npx", "args": ["-y", "skillsbd", "add", pkg],
+                "install": pkg,
+                "repo_url": f"https://github.com/{pkg}" if owner else None,
+                "installs": rec.get("installs", 0),
+                "form_fields": []}
 
     def _card_for(self, kind: str, slug: str) -> dict | None:
         """Карточка каталога. Для /mcp/* стараемся достать команду
