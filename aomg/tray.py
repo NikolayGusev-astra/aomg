@@ -70,7 +70,13 @@ def make_icon(state: str, base: Image.Image | None = None) -> Image.Image:
     return img
 
 
-def run_tray(healths, supervisor, on_quit, gateway_port: int = 9300) -> None:
+def run_tray(supervisor, on_quit, gateway_port: int = 9300) -> None:
+    """Иконка в трее.
+
+    Состояние серверов читается из Supervisor (ADR-0003) — своего
+    словаря Health у трея больше нет, поэтому сервер, добавленный
+    в панели, сразу появляется в меню трея.
+    """
     import pystray
 
     def open_admin(*_):
@@ -78,10 +84,14 @@ def run_tray(healths, supervisor, on_quit, gateway_port: int = 9300) -> None:
 
     def restart_all(*_):
         for n in list(supervisor.managed):
-            supervisor.restart(n)
+            supervisor.restart(n, manual=True)
+
+    def states() -> list:
+        return [h for _, h in supervisor.snapshot()]
 
     menu = pystray.Menu(
-        pystray.MenuItem(lambda _: status_line(healths), None, enabled=False),
+        pystray.MenuItem(lambda _: status_line(states()), None,
+                         enabled=False),
         pystray.Menu.SEPARATOR,
         pystray.MenuItem("Открыть управление", open_admin, default=True),
         pystray.MenuItem("Перезапустить всё", restart_all),
@@ -95,10 +105,11 @@ def run_tray(healths, supervisor, on_quit, gateway_port: int = 9300) -> None:
     def refresher():
         import time
         while True:
-            state = aggregate_state(list(healths.values()))
+            hs = states()
+            state = aggregate_state(hs)
             try:
                 icon.icon = make_icon(state, base_icon)
-                icon.title = "AOMG — " + status_line(healths)
+                icon.title = "AOMG — " + status_line(hs)
             except Exception:
                 pass
             time.sleep(5)
@@ -108,6 +119,13 @@ def run_tray(healths, supervisor, on_quit, gateway_port: int = 9300) -> None:
 
 
 def status_line(healths) -> str:
-    parts = [f"{n}: {h.state}" + (f" ({h.tools} тулов)" if h.state == "ok" else "")
+    """Строка статуса из Health'ов (не из имён — имена рисует панель)."""
+    if isinstance(healths, list):
+        parts = [f"{h.state}" + (f" ({h.tools} тулов)"
+                                 if h.state == "ok" else "")
+                 for h in healths]
+        return " | ".join(parts) or "нет серверов"
+    parts = [f"{n}: {h.state}" + (f" ({h.tools} тулов)"
+                                  if h.state == "ok" else "")
              for n, h in healths.items()]
     return " | ".join(parts) or "нет серверов"

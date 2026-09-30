@@ -47,6 +47,21 @@ def _is_secret(k: str) -> bool:
 _SECRET_KEY_NAMES = {"authorization", "proxy-authorization", "cookie"}
 
 
+async def _json_body(request: Request) -> dict | None:
+    """Разбор тела запроса. Кривой JSON -> None, а не 500.
+
+    Раньше `await request.json()` бросал JSONDecodeError прямо наружу:
+    опечатка в теле от панели или от curl давала 500 с трейсбеком
+    вместо внятного «неверный запрос». Ошибка ввода — это 400, а не
+    авария приложения.
+    """
+    try:
+        data = await request.json()
+    except Exception:
+        return None
+    return data if isinstance(data, dict) else None
+
+
 def _mask_headers(hdrs: dict) -> dict:
     """Секреты в заголовках маскируются: по имени ключа (key/token/…) и
     по классическим носителям (Authorization, Cookie)."""
@@ -56,9 +71,17 @@ def _mask_headers(hdrs: dict) -> dict:
 
 
 def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
-                   healths: dict[str, Health], config_path: Path,
+                   config_path: Path,
                    restart_watchdog: callable) -> None:
-    """Роуты админки. config_path нужен для сохранения yaml."""
+    """Роуты админки. config_path нужен для сохранения yaml.
+
+    `healths` больше не параметр: состоянием владеет Supervisor
+    (ADR-0003), панель читает его через health()/snapshot().
+    """
+
+    def health_of(name: str):
+        h = supervisor.health(name)
+        return h if h is not None else Health()
 
     def raw_config() -> dict:
         import yaml
@@ -74,10 +97,11 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                for k, v in spec.env.items()}
         hdrs = {k: ("***" if _is_secret(k) and v else v)
                 for k, v in spec.headers.items()}
+        h = health_of(name)
         return {"name": name, "kind": spec.kind, "group": spec.group,
                 "url": spec.url, "command": spec.command, "env": env,
-                "headers": hdrs, "state": healths[name].state,
-                "tools": healths[name].tools, "error": healths[name].error}
+                "headers": hdrs, "state": h.state,
+                "tools": h.tools, "error": h.error}
 
     # ---- данные ----
 
@@ -88,68 +112,88 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
 
     # ---- каталог: источники (ADR-0002) ----
 
-    def _build_catalog_sources(cfg_obj: Config) -> dict:
-        """official + neuraldeep (встроенные) + json-источники из конфига."""
+    def _build_catalog_sources() -> None:
+        """official + neuraldeep (встроенные) + json-источники из конфига.
+
+        Источник получает прокси своей egress-группы при создании
+        (ADR-0005 I2) — group из конфига перестаёт быть декоративным.
+        """
+        from .catalog import NeuralDeepSource
         from .json_source import JsonSource
         sources: dict = {"official": _OfficialIndexAdapter(
             config_path.parent / "registry-index.json")}
-        nd_spec = cfg_obj.catalog_sources.get("neuraldeep")
+        nd_spec = cfg.catalog_sources.get("neuraldeep")
         if not (nd_spec and nd_spec.hidden):
-            from .catalog import NeuralDeepSource
-            sources["neuraldeep"] = NeuralDeepSource()
-        for name, spec in cfg_obj.catalog_sources.items():
+            sources["neuraldeep"] = NeuralDeepSource(
+                proxy=cfg.egress_for_group(
+                    nd_spec.group if nd_spec else "direct"))
+        for name, spec in cfg.catalog_sources.items():
             if spec.type == "json":
-                sources[name] = JsonSource(spec, cache_dir=config_path.parent)
-        return sources
+                sources[name] = JsonSource(
+                    spec, cache_dir=config_path.parent,
+                    proxy=cfg.egress_for_group(spec.group))
+        app.state.catalog_sources = sources
+
+    def _rebuild_one_source(name: str) -> None:
+        """Пересоздать ОДИН источник, не трогая остальные (ADR-0005 I3).
+
+        Прежняя пересборка всего словаря на каждый upsert выбрасывала
+        кэш и состояние всех остальных источников.
+        """
+        from .json_source import JsonSource
+        spec = cfg.catalog_sources.get(name)
+        if spec is None or spec.type != "json":
+            app.state.catalog_sources.pop(name, None)
+            return
+        app.state.catalog_sources[name] = JsonSource(
+            spec, cache_dir=config_path.parent,
+            proxy=cfg.egress_for_group(spec.group))
 
     class _OfficialIndexAdapter:
-        """Тонкая обёртка CatalogIndex под интерфейс источников каталога."""
+        """Официальный реестр под единым контрактом (ADR-0005).
+
+        Состояние — результат последней попытки, а не константа «ok»:
+        раньше зелёный свет горел у источника, который не отвечает.
+        """
 
         name = "official"
 
         def __init__(self, index_path: Path):
             from .index import CatalogIndex
             self._idx = CatalogIndex(index_path)
+            self.state = "unprobed"
+            self.error: str | None = None
 
-        def state_info(self) -> dict:
-            age = self._idx.age()
-            if age is None:
-                return {"state": "error", "error": "index not built yet"}
-            return {"state": "ok", "error": None}
+        def status(self) -> tuple:
+            return self.state, self.error
 
-        def search(self, query: str, limit: int = 20) -> list[dict]:
-            stale = self._idx.is_stale()
-            items = self._idx.search(query, limit=limit)
-            if not items:
-                try:
-                    entries = registry_search(query, limit=limit)
-                    items = [c for c in
-                             (_entry_to_item(e) for e in entries) if c]
-                except Exception:
-                    pass
-            elif stale:
-                self._idx.ensure_fresh()
+        def search(self, query: str = "", limit: int = 50,
+                   offset: int = 0) -> dict:
+            found = self._idx.search(query, limit=limit + offset)
+            total = len(found)
+            items = found[offset:offset + limit]
             for card in items:
                 card.setdefault("source", "official")
-            return items
+            if self._idx.is_stale():
+                self._idx.ensure_fresh()   # фоново, ответ не ждём
+                self.state, self.error = "ok", None
+            else:
+                self.state, self.error = "ok", None
+            return {"items": items, "total": total,
+                    "has_more": offset + len(items) < total}
 
-    app.state.catalog_sources = _build_catalog_sources(cfg)
+    _build_catalog_sources()
     BUILTIN_SOURCES = ("official", "neuraldeep")
 
     def _source_public(name: str, src) -> dict:
-        if name == "official":
-            info = src.state_info()
-        elif hasattr(src, "state"):          # JsonSource
-            info = {"state": src.state, "error": src.error}
-        else:                                 # NeuralDeepSource — ленивый
-            info = {"state": "ok", "error": None}
+        state, error = src.status()
         spec = cfg.catalog_sources.get(name)
         out = {"name": name,
                "type": spec.type if spec else
                        ("json" if name == "neuraldeep" else "builtin"),
                "group": spec.group if spec else "direct",
                "hidden": spec.hidden if spec else False,
-               **info}
+               "state": state, "error": error}
         if spec and spec.url:
             out["url"] = spec.url
         if spec and spec.headers:
@@ -158,7 +202,6 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
 
     @app.get("/admin/api/catalog/sources")
     def api_catalog_sources() -> dict:
-        # official всегда первый
         srcs = app.state.catalog_sources
         names = [n for n in ("official", "neuraldeep") if n in srcs] + \
                 [n for n in srcs if n not in BUILTIN_SOURCES]
@@ -166,7 +209,9 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
 
     @app.post("/admin/api/catalog/sources")
     async def api_catalog_source_upsert(request: Request) -> dict:
-        data = await request.json()
+        data = await _json_body(request)
+        if data is None:
+            return {"error": "неверный JSON в теле запроса"}
         name = re.sub(r"[^a-z0-9_-]", "", (data.get("name") or "").lower())
         if not name or name in BUILTIN_SOURCES:
             return {"error": "bad name"}
@@ -179,11 +224,12 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
             "headers": data.get("headers") or {}}
         save_raw(raw)
         try:
-            reloaded = load_config(config_path)
-            cfg.catalog_sources = reloaded.catalog_sources
+            cfg.catalog_sources = load_config(config_path).catalog_sources
         except Exception:
             pass
-        app.state.catalog_sources = _build_catalog_sources(cfg)
+        # пересоздаём ТОЛЬКО этот источник: остальные сохраняют кэш
+        # и состояние (ADR-0005 I3)
+        _rebuild_one_source(name)
         return {"saved": name}
 
     @app.post("/admin/api/catalog/sources/{name}/delete")
@@ -200,56 +246,64 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
         return {"deleted": name}
 
     @app.get("/admin/api/catalog")
-    def api_catalog(query: str = "", source: str = "") -> dict:
-        """Поиск по каталогу. source='' или 'official' — локальный индекс
-        реестра (aomg/index.py, мгновенный, stale-while-revalidate);
-        другой source — соответствующий источник из catalog_sources."""
-        from . import index as _index
+    async def api_catalog(request: Request, query: str = "", source: str = "",
+                          limit: int = 50, offset: int = 0) -> dict:
+        """Поиск по каталогу с пагинацией.
 
+        source=''/'official' — локальный индекс реестра (мгновенно);
+        остальные — из catalog_sources. Живой фолбэк реестра
+        ограничен по времени (ADR-0005 I4) и живёт в async-клиенте,
+        поэтому недоступный реестр не вешает панель на 20 секунд.
+        """
         src_name = source or "official"
         src = app.state.catalog_sources.get(src_name)
         if src is None:
-            return {"items": [], "error": f"unknown source: {src_name}"}
+            return {"items": [], "total": 0, "has_more": False,
+                    "error": f"unknown source: {src_name}"}
+        n = max(1, min(int(limit or 50), 200))
+        off = max(0, int(offset or 0))
+        result = src.search(query or "", limit=n, offset=off)
+        state, err = src.status()
+        out = {"source": src_name, "limit": n, "offset": off,
+               "state": state, **result}
+        if err:
+            out["error"] = err
+        if not result["items"] and state != "ok":
+            out["notice"] = "Источник недоступен — показаны последние " \
+                            "известные данные" if result["total"] else \
+                            f"Источник недоступен: {err or state}"
+        if src_name == "official" and not result["items"] and query:
+            entries = await _live_registry(query, limit=n)
+            if entries:
+                out["items"] = entries
+                out["total"] = len(entries)
+                out["source"] = "official"
+                out["notice"] = "Показано из реестра напрямую " \
+                                "(локальный индекс обновляется в фоне)"
+            else:
+                out["notice"] = "Реестр MCP недоступен, локальный индекс " \
+                                "пуст — попробуйте позже"
+        elif src_name == "official" and not result["items"] \
+                and not query and not result.get("notice"):
+            out["notice"] = "Каталог загружается (первая синхронизация " \
+                            "реестра)…"
+        return out
 
-        if src_name != "official":
-            items = src.search(query or "", limit=20)
-            out: dict = {"items": items, "source": src_name}
-            if getattr(src, "state", "ok") != "ok":
-                out["error"] = getattr(src, "error", None) or src.state
-                out["items"] = []
-            return out
-
-        idx: _index.CatalogIndex = getattr(api_catalog, "_index", None)
-        if idx is None:
-            idx = api_catalog._index = _index.CatalogIndex(
-                config_path.parent / "registry-index.json")
-
-        q = query or "mcp"
-        stale = idx.is_stale()
-        items = idx.search(q, limit=20)
-        if items:
-            if stale:
-                idx.ensure_fresh()  # фоново обновит, ответ не ждём
-            return {"items": items, "cached": stale, "source": "official"}
-        # индекс пуст (первый запуск и sync ещё не дошёл) — живой фолбэк
+    async def _live_registry(query: str, limit: int) -> list:
+        """Живой реестр как последний фолбэк, с жёстким потолком."""
+        from .registry import search_async
         try:
-            entries = registry_search(q, limit=20)
-        except Exception as ex:
-            # индекс может просто ещё не скачан — сообщаем статус, не пугаем
-            return {"items": [], "error": None,
-                    "notice": "Каталог загружается (первая синхронизация реестра)…",
-                    "source": "official"}
-        items = [_entry_to_item(e) for e in entries if _entry_to_item(e)]
-        if items:
-            try:
-                idx.ensure_fresh()  # дольём полный индекс в фоне
-            except Exception:
-                pass
-            return {"items": items, "cached": False, "source": "official"}
-        # пусто и в реестре: возможно, индекс протух — обновим в фоне
-        if stale:
-            idx.ensure_fresh()
-        return {"items": [], "cached": False, "source": "official"}
+            entries = await search_async(query, limit=limit)
+        except Exception as e:
+            return []
+        cards = [_entry_to_item(e) for e in entries]
+        out = []
+        for c in cards:
+            if not c:
+                continue
+            c.setdefault("source", "official")
+            out.append(c)
+        return out
 
     @app.get("/admin/api/groups")
     def api_groups() -> dict:
@@ -265,20 +319,26 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
         raw = raw_config()
         raw.get("servers", {}).pop(name, None)
         save_raw(raw)
+        # supervisor.remove снимает сервер из managed, healths, fails и
+        # конфига разом — частичного удаления больше не бывает
+        # (ADR-0003 I1).
         supervisor.remove(name)
-        healths.pop(name, None)
         return {"deleted": name}
 
     @app.post("/admin/api/servers/{name}/restart")
     def api_restart(name: str) -> dict:
-        supervisor.restart(name)
+        # manual=True: сбрасывает цепь неудач и замыкает разомкнутый
+        # автомат — иначе «Перезапустить» ничего бы не дал (ADR-0004 I3).
+        supervisor.restart(name, manual=True)
         return {"restarted": name}
 
     @app.post("/admin/api/servers")
     async def api_upsert(request: Request) -> dict:
         """Создать/обновить. body: name, kind, url|command, group, ключи.
         form_fields (из каталога): [{name, secret, template}] — поля формы."""
-        data = await request.json()
+        data = await _json_body(request)
+        if data is None:
+            return {"error": "неверный JSON в теле запроса"}
         name = re.sub(r"[^a-z0-9_-]", "", (data.get("name") or "").lower())
         if not name:
             return {"error": "bad name"}
@@ -308,23 +368,31 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
             return {"error": "нужен url или command"}
         servers[name] = entry
         save_raw(raw)
-        # рантайм-конфиг обязан увидеть новую запись ДО ensure(), иначе
-        # supervisor молча пропустит спавн (баг: запись в yaml была,
-        # а в списке сервер не появлялся до полного рестарта AOMG)
+        # рантайм-конфиг обязан увидеть новую запись ДО add(), иначе
+        # supervisor не найдёт spec. И add() создаёт Health вместе
+        # с ManagedServer — раньше Health не создавался вовсе, и
+        # watchdog падал на KeyError (ADR-0003).
         try:
             reloaded = load_config(config_path)
             cfg.groups = reloaded.groups
             cfg.servers = reloaded.servers
         except Exception:
-            pass  # битый yaml не роняем — ensure() просто не найдёт запись
-        supervisor.ensure(name)
+            cfg.servers[name] = ServerSpec(
+                name=name, kind="http" if data.get("url") else "stdio",
+                group=group, url=data.get("url"),
+                command=data.get("command"),
+                args=data.get("args") or [])
+        supervisor.add(name)
+        supervisor.collect_secrets()
         return {"saved": name}
 
     # ---- страница ----
 
     @app.get("/admin", response_class=HTMLResponse)
-    def admin_page() -> HTMLResponse:
-        return HTMLResponse(_PAGE)
+    def admin_page() -> Response:
+        # Порт в легенде — фактический из конфига, а не константа
+        # (ADR-0006 I4): при авто-выборе он отличается от 9300.
+        return HTMLResponse(_PAGE.replace("{port}", str(cfg.gateway_port)))
 
 
 _PAGE = """<!doctype html>
@@ -417,7 +485,7 @@ _PAGE = """<!doctype html>
 </div>
 <div class="legend">Зелёный — работает · жёлтый — перезапуск или нет сети · красный — не отвечает.<br>
 Агенту ничего настраивать не нужно: каждый сервер доступен на
-<code>http://127.0.0.1:9300/&lt;имя&gt;/mcp</code> автоматически.</div>
+<code>http://127.0.0.1:{port}/&lt;имя&gt;/mcp</code> автоматически.</div>
 
 <dialog id="dlg">
 <h2>Добавить MCP-сервер</h2>
@@ -497,6 +565,7 @@ async function del(n){ if(!confirm('Удалить '+n+'?'))return;
   await fetch(`/admin/api/servers/${n}/delete`,{method:'POST'}); refresh(); }
 let tmr; let searching=false;
 let CAT_ITEMS=[]; let SOURCES=[]; let ACTIVE_SRC='official';
+const CAT_LIMIT=50; let CAT_OFFSET=0;
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
   .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
 
@@ -515,7 +584,7 @@ async function loadSources(){
   `<button class="btn cat-src-btn" onclick="openSources()">Источники…</button>`;
 }
 function switchSource(name){
-  ACTIVE_SRC=name;
+  ACTIVE_SRC=name; CAT_OFFSET=0; CAT_ITEMS=[];
   clearTimeout(tmr); searching=false;   // старый запрос больше не актуален
   loadSources(); search();
 }
@@ -570,7 +639,9 @@ async function delSource(n){ if(!confirm('Удалить источник '+n+'?
   if(ACTIVE_SRC===n) ACTIVE_SRC='official';
   await renderSourceList(); loadSources(); }
 
-function search(){ clearTimeout(tmr);
+async function search(reset){
+  clearTimeout(tmr);
+  if(!reset) CAT_OFFSET=0; else CAT_OFFSET+=CAT_LIMIT;
   tmr=setTimeout(async()=>{
     const q=document.getElementById('q').value;
     const cat=document.getElementById('cat');
@@ -578,16 +649,27 @@ function search(){ clearTimeout(tmr);
     searching=true;
     cat.innerHTML='<div><span>ищу…</span></div>';
     try{
-      const d=await (await fetch(`/admin/api/catalog?source=${encodeURIComponent(ACTIVE_SRC)}&query=${encodeURIComponent(q)}`)).json();
-      CAT_ITEMS = d.items||[];
-      cat.innerHTML = CAT_ITEMS.map((i,idx)=>`
+      const d=await (await fetch(`/admin/api/catalog?source=${encodeURIComponent(ACTIVE_SRC)}&query=${encodeURIComponent(q)}&limit=${CAT_LIMIT}&offset=${CAT_OFFSET}`)).json();
+      CAT_ITEMS = reset ? (d.items||[]) : CAT_ITEMS.concat(d.items||[]);
+      let html = CAT_ITEMS.map((i,idx)=>`
         <div data-idx="${idx}" class="cat-item" style="cursor:pointer">
           <b>${esc(i.title||i.name)}</b><span>${esc((i.description||'').slice(0,90))}</span>
-        </div>`).join('') || (d.notice
-          ? `<div style="opacity:.7">${esc(d.notice)}</div>`
-          : '<div><span>ничего не найдено</span></div>');
-      if(d.error) cat.innerHTML+=`<div><span style="color:var(--err)">${esc(d.error)}</span></div>`;
-      if(d.cached) cat.innerHTML+='<div><span style="opacity:.6">из локального индекса (обновляется в фоне)</span></div>';
+        </div>`).join('');
+      if(!CAT_ITEMS.length) html = d.notice
+        ? `<div style="opacity:.7">${esc(d.notice)}</div>`
+        : (d.error ? `<div><span style="color:var(--err)">${esc(d.error)}</span></div>`
+                   : '<div><span>ничего не найдено</span></div>');
+      // пагинация вместо «магического числа»: пользователь сам решает,
+      // показывать ли следующую страницу (ADR-0005 I5)
+      if(d.total>CAT_ITEMS.length)
+        html+=`<div id="more" style="padding:9px 12px;cursor:pointer;
+          color:var(--acc);font-size:13px">показать ещё
+          (${CAT_ITEMS.length} из ${d.total})</div>`;
+      if(d.notice && CAT_ITEMS.length)
+        html+=`<div><span style="opacity:.6">${esc(d.notice)}</span></div>`;
+      cat.innerHTML = html;
+      const more=document.getElementById('more');
+      if(more) more.addEventListener('click',()=>search(true));
       cat.querySelectorAll('.cat-item').forEach(el=>{
         el.addEventListener('click', ()=>pick(CAT_ITEMS[+el.dataset.idx]));
       });
