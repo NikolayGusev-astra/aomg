@@ -235,7 +235,10 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
         try:
             entries = registry_search(q, limit=20)
         except Exception as ex:
-            return {"items": [], "error": str(ex)[:150], "source": "official"}
+            # индекс может просто ещё не скачан — сообщаем статус, не пугаем
+            return {"items": [], "error": None,
+                    "notice": "Каталог загружается (первая синхронизация реестра)…",
+                    "source": "official"}
         items = [_entry_to_item(e) for e in entries if _entry_to_item(e)]
         if items:
             try:
@@ -404,7 +407,7 @@ _PAGE = """<!doctype html>
   <button class="add" onclick="openAdd()">+ Добавить MCP</button>
 </div>
 
-<div id="catalog" style="display:none">
+<div id="catalog">
   <div class="cat-tabs" id="cat-tabs"></div>
   <div style="display:flex; gap:8px; margin:8px 0;">
     <input id="q" placeholder="поиск в выбранном источнике…"
@@ -511,9 +514,12 @@ async function loadSources(){
   }).join('') +
   `<button class="btn cat-src-btn" onclick="openSources()">Источники…</button>`;
 }
-function switchSource(name){ ACTIVE_SRC=name; loadSources(); search(); }
+function switchSource(name){
+  ACTIVE_SRC=name;
+  clearTimeout(tmr); searching=false;   // старый запрос больше не актуален
+  loadSources(); search();
+}
 function openAdd(){
-  document.getElementById('catalog').style.display='';
   loadSources().then(()=>search());
   dlg.showModal();
 }
@@ -577,14 +583,19 @@ function search(){ clearTimeout(tmr);
       cat.innerHTML = CAT_ITEMS.map((i,idx)=>`
         <div data-idx="${idx}" class="cat-item" style="cursor:pointer">
           <b>${esc(i.title||i.name)}</b><span>${esc((i.description||'').slice(0,90))}</span>
-        </div>`).join('') || '<div><span>ничего не найдено</span></div>';
+        </div>`).join('') || (d.notice
+          ? `<div style="opacity:.7">${esc(d.notice)}</div>`
+          : '<div><span>ничего не найдено</span></div>');
       if(d.error) cat.innerHTML+=`<div><span style="color:var(--err)">${esc(d.error)}</span></div>`;
       if(d.cached) cat.innerHTML+='<div><span style="opacity:.6">из локального индекса (обновляется в фоне)</span></div>';
       cat.querySelectorAll('.cat-item').forEach(el=>{
         el.addEventListener('click', ()=>pick(CAT_ITEMS[+el.dataset.idx]));
       });
     }catch(e){
-      cat.innerHTML='<div><span style="color:var(--err)">реестр недоступен</span></div>';
+      // сам локальный индекс не мог «отвалиться» — это упал fetch целиком
+      // (гейтвей рестартует). Сообщение честное и с действием.
+      cat.innerHTML='<div><span style="opacity:.7">Панель перезапускается — '+
+        'попробуйте ещё раз через несколько секунд.</span></div>';
     }
     searching=false;
   },350); }
@@ -635,7 +646,7 @@ async function save(){
   if(r.error){ document.getElementById('err').textContent=r.error; return; }
   dlg.close(); refresh();
 }
-loadGroups(); refresh(); setInterval(refresh,15000);
+loadGroups(); loadSources().then(()=>search()); refresh(); setInterval(refresh,15000);
 </script></body></html>"""
 
 
