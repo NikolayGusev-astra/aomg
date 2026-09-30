@@ -649,9 +649,16 @@ async function delSource(n){ if(!confirm('Удалить источник '+n+'?
   if(ACTIVE_SRC===n) ACTIVE_SRC='official';
   await renderSourceList(); loadSources(); }
 
-async function search(reset){
+async function search(nextPage){
   clearTimeout(tmr);
-  if(!reset) CAT_OFFSET=0; else CAT_OFFSET+=CAT_LIMIT;
+  // `nextPage` = «показать ещё». Раньше аргумент назывался reset и был
+  // инвертирован: `if(!reset) CAT_OFFSET=0` сбрасывало offset именно
+  // для «ещё», и следующая страница конкатенировалась поверх первой —
+  // пользователь видел каждый сервер дважды.
+  // Имя не `more`: ниже в этой же области есть
+  // `const more=document.getElementById('more')`, и одноимённый параметр
+  // давал TDZ-ошибку в блоке catch.
+  if(nextPage) CAT_OFFSET+=CAT_LIMIT; else CAT_OFFSET=0;
   tmr=setTimeout(async()=>{
     const q=document.getElementById('q').value;
     const cat=document.getElementById('cat');
@@ -660,7 +667,7 @@ async function search(reset){
     cat.innerHTML='<div><span>ищу…</span></div>';
     try{
       const d=await (await fetch(`/admin/api/catalog?source=${encodeURIComponent(ACTIVE_SRC)}&query=${encodeURIComponent(q)}&limit=${CAT_LIMIT}&offset=${CAT_OFFSET}`)).json();
-      CAT_ITEMS = reset ? (d.items||[]) : CAT_ITEMS.concat(d.items||[]);
+      CAT_ITEMS = nextPage ? CAT_ITEMS.concat(d.items||[]) : (d.items||[]);
       let html = CAT_ITEMS.map((i,idx)=>`
         <div data-idx="${idx}" class="cat-item" style="cursor:pointer">
           <b>${esc(i.title||i.name)}</b><span>${esc((i.description||'').slice(0,90))}</span>
@@ -684,8 +691,10 @@ async function search(reset){
         el.addEventListener('click', ()=>pick(CAT_ITEMS[+el.dataset.idx]));
       });
     }catch(e){
-      // сам локальный индекс не мог «отвалиться» — это упал fetch целиком
-      // (гейтвей рестартует). Сообщение честное и с действием.
+      // локальный индекс не мог «отвалиться» сам: это упал fetch
+      // целиком (гейтвей перезапускается). Сообщение честное и с
+      // действием, причина остаётся в консоли браузера.
+      console.error('catalog:', e);
       cat.innerHTML='<div><span style="opacity:.7">Панель перезапускается — '+
         'попробуйте ещё раз через несколько секунд.</span></div>';
     }
