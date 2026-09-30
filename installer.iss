@@ -3,7 +3,7 @@
 ; Собирается: ISCC.exe installer.iss  (пути к exe — dist/)
 
 #define MyAppName "AOMG"
-#define MyAppVersion "0.1.1"
+#define MyAppVersion "0.1.2"
 #define MyAppPublisher "NikolayGusev-astra"
 #define MyAppURL "https://github.com/NikolayGusev-astra/aomg"
 #define MyAppExeName "AOMG.exe"

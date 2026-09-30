@@ -1,0 +1,25 @@
+[
+  {
+    "name": "blender-mcp",
+    "title": "Blender MCP (ahujasid)",
+    "description": "Community plugin (29.7k stars) to control Blender 3D with any LLM: scene manipulation, object creation, material handling. Install the Blender addon, then run: uvx blender-mcp",
+    "command": "uvx blender-mcp",
+    "url": null,
+    "repo": "https://github.com/ahujasid/mcp-for-blender"
+  },
+  {
+    "name": "unreal-mcp",
+    "title": "Unreal Engine MCP (ChiR24 via Smithery)",
+    "description": "Unreal Engine automation MCP: actors, levels, blueprints. Remote endpoint hosted by Smithery, API key required (form asks for it).",
+    "url": "https://server.smithery.ai/@ChiR24/unreal_mcp/mcp",
+    "headers": { "X-API-Key": "" },
+    "repo": "https://github.com/ChiR24/unreal_mcp"
+  },
+  {
+    "name": "unreal-mcp-server",
+    "title": "Unreal MCP Server (kvick-games)",
+    "description": "Unreal Engine 5 MCP server: control UE5 editor via MCP tools. Local python stdio server: uvx unreal-mcp-server",
+    "command": "uvx unreal-mcp",
+    "repo": "https://github.com/kvick-games/UnrealMCP"
+  }
+]

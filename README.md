@@ -35,7 +35,7 @@ MCP в одном месте.
 
 ## Быстрый старт
 
-Готовые бинарники: [релиз v0.1.1](https://github.com/NikolayGusev-astra/aomg/releases/latest)
+Готовые бинарники: [релиз v0.1.2](https://github.com/NikolayGusev-astra/aomg/releases/latest)
 
 - **Инсталлятор** `AOMG-setup-*.exe` — per-user установка в
   `%LOCALAPPDATA%\Programs\AOMG`, ярлыки, опциональный автозапуск
@@ -67,7 +67,7 @@ gateway_port: 9300
 
 groups:
   direct:    {name: "Дом (напрямую)", proxy: null}
-  vpn:       {name: "Через VPN",      proxy: "socks5://127.0.0.1:10808"}
+  vpn:       {name: "Через VPN",      proxy: "socks5://127.0.0.1:1080"}
   corporate: {name: "Рабочая сеть",   proxy: "http://corp-gw:3128"}
 
 servers:

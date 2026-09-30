@@ -1,0 +1,77 @@
+name: build
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: AOMG-windows
+            exe_ext: .exe
+            pyinstaller_opts: ""
+          - os: ubuntu-latest
+            artifact: AOMG-linux
+            exe_ext: ""
+            pyinstaller_opts: ""
+          - os: macos-latest
+            artifact: AOMG-macos
+            exe_ext: ""
+            pyinstaller_opts: ""
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+
+      - name: Build AOMG (onedir)
+        run: pyinstaller AOMG.spec --noconfirm --distpath dist --workpath build
+
+      - name: Build mcp-proxy (onedir, own runtime dir)
+        run: pyinstaller mcpproxy.spec --noconfirm --distpath dist --workpath build
+
+      - name: Assemble bundle
+        shell: bash
+        run: |
+          cp dist/mcp-proxy/mcp-proxy${{ matrix.exe_ext }} dist/AOMG/
+          cp -r dist/mcp-proxy/mcp_proxy_internal dist/AOMG/
+          cp config.example.yaml dist/AOMG/
+          cd dist && tar -czf ../${{ matrix.artifact }}.tar.gz AOMG/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: ${{ matrix.artifact }}.tar.gz
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+
+      - name: Create release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            AOMG-windows.tar.gz
+            AOMG-linux.tar.gz
+            AOMG-macos.tar.gz
+          generate_release_notes: true

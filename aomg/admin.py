@@ -375,6 +375,22 @@ _PAGE = """<!doctype html>
          font-size:13.5px; }
   .cat div:hover { background:var(--bg); }
   .cat b { display:block; } .cat span { color:var(--mut); font-size:12px; }
+  .cat-tabs { display:flex; gap:6px; margin:10px 0 4px; flex-wrap:wrap;
+              align-items:center; }
+  .cat-tab { background:transparent; border:1px solid var(--line);
+          color:var(--mut); border-radius:8px; padding:6px 12px;
+          font-size:13px; cursor:pointer; display:flex; align-items:center;
+          gap:7px; }
+  .cat-tab.active { color:var(--fg); border-color:var(--acc); }
+  .cat-tab .dot { width:8px; height:8px; border-radius:50%; flex:none; }
+  .cat-tab .dot.ok{background:var(--ok)} .cat-tab .dot.error,
+  .cat-tab .dot.unreachable{background:var(--err)}
+  .cat-src-btn { margin-left:auto; }
+  .srcrow { display:flex; align-items:center; gap:10px; padding:9px 4px;
+          border-bottom:1px solid var(--line); font-size:13.5px; }
+  .srcrow .nm { font-weight:600; }
+  .srcrow .meta { color:var(--mut); font-size:12px; flex:1;
+          white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
   .actions { display:flex; gap:10px; justify-content:flex-end; margin-top:20px; }
   .primary { background:var(--acc); color:#17141f; border:none;
          border-radius:8px; padding:9px 18px; font-weight:600; cursor:pointer; }
@@ -384,17 +400,24 @@ _PAGE = """<!doctype html>
 <h1>AOMG <span>· MCP-шлюз</span></h1>
 <div class="sub" id="agg">загрузка…</div>
 <div id="list"></div>
-<div class="bar"><button class="add" onclick="dlg.showModal()">+ Добавить MCP</button></div>
+<div class="bar">
+  <button class="add" onclick="openAdd()">+ Добавить MCP</button>
+</div>
+
+<div id="catalog" style="display:none">
+  <div class="cat-tabs" id="cat-tabs"></div>
+  <div style="display:flex; gap:8px; margin:8px 0;">
+    <input id="q" placeholder="поиск в выбранном источнике…"
+           oninput="search()" style="flex:1">
+  </div>
+  <div class="cat" id="cat"></div>
+</div>
 <div class="legend">Зелёный — работает · жёлтый — перезапуск или нет сети · красный — не отвечает.<br>
 Агенту ничего настраивать не нужно: каждый сервер доступен на
 <code>http://127.0.0.1:9300/&lt;имя&gt;/mcp</code> автоматически.</div>
 
 <dialog id="dlg">
 <h2>Добавить MCP-сервер</h2>
-<label>Найти в каталоге</label>
-<input id="q" placeholder="например: jira, calendar, github…"
-       oninput="search()">
-<div class="cat" id="cat"></div>
 <label>Имя</label>
 <input id="f-name" placeholder="my-server">
 <label>Тип</label>
@@ -417,6 +440,26 @@ _PAGE = """<!doctype html>
 <div class="actions">
   <button class="btn" onclick="dlg.close()">Отмена</button>
   <button class="primary" onclick="save()">Сохранить и подключить</button>
+</div>
+</dialog>
+
+<dialog id="srcdlg">
+<h2>Источники каталога</h2>
+<div id="src-list" style="max-height:260px; overflow:auto;"></div>
+<div class="err" id="src-err"></div>
+<h2 style="margin-top:18px">Добавить источник</h2>
+<label>Имя (латиницей)</label>
+<input id="s-name" placeholder="corp">
+<label>URL JSON-манифеста</label>
+<input id="s-url" placeholder="https://…/mcp-servers.json">
+<label>Группа сети (egress)</label>
+<select id="s-group"></select>
+<label>Заголовок авторизации (необязательно)</label>
+<input id="s-hdr" placeholder="Authorization" value="Authorization">
+<input id="s-hdrval" placeholder="Bearer …" type="password">
+<div class="actions">
+  <button class="btn" onclick="srcdlg.close()">Закрыть</button>
+  <button class="primary" onclick="addSource()">Добавить</button>
 </div>
 </dialog>
 </div>
@@ -450,9 +493,77 @@ async function restart(n){ await fetch(`/admin/api/servers/${n}/restart`,{method
 async function del(n){ if(!confirm('Удалить '+n+'?'))return;
   await fetch(`/admin/api/servers/${n}/delete`,{method:'POST'}); refresh(); }
 let tmr; let searching=false;
-let CAT_ITEMS=[];
+let CAT_ITEMS=[]; let SOURCES=[]; let ACTIVE_SRC='official';
 function esc(s){ return (s||'').replace(/&/g,'&amp;').replace(/</g,'&lt;')
   .replace(/>/g,'&gt;').replace(/"/g,'&quot;').replace(/'/g,'&#39;'); }
+
+// ---- каталог: источники и табы ----
+async function loadSources(){
+  const d = await (await fetch('/admin/api/catalog/sources')).json();
+  SOURCES = (d.sources||[]).filter(s=>!s.hidden);
+  const tabs = document.getElementById('cat-tabs');
+  tabs.innerHTML = SOURCES.map(s=>{
+    const st = s.state==='ok'?'ok':(s.state||'error');
+    const title = s.error ? esc(s.error) : (s.state==='ok'?'доступен':esc(s.state));
+    return `<button class="cat-tab ${s.name===ACTIVE_SRC?'active':''}"
+      onclick="switchSource('${s.name}')" title="${title}">
+      <span class="dot ${st}"></span>${esc(s.name)}</button>`;
+  }).join('') +
+  `<button class="btn cat-src-btn" onclick="openSources()">Источники…</button>`;
+}
+function switchSource(name){ ACTIVE_SRC=name; loadSources(); search(); }
+function openAdd(){
+  document.getElementById('catalog').style.display='';
+  loadSources().then(()=>search());
+  dlg.showModal();
+}
+async function openSources(){
+  document.getElementById('s-group').innerHTML =
+    GROUPS.map(g=>`<option value="${g.id}">${g.name}</option>`).join('');
+  await renderSourceList();
+  srcdlg.showModal();
+}
+async function renderSourceList(){
+  const d = await (await fetch('/admin/api/catalog/sources')).json();
+  document.getElementById('src-list').innerHTML = (d.sources||[]).map(s=>{
+    const builtin = s.name==='official'||s.name==='neuraldeep';
+    const del = builtin ? '' :
+      `<button class="btn danger" onclick="delSource('${s.name}')">Удалить</button>`;
+    const hdr = s.headers ? Object.entries(s.headers)
+      .map(([k,v])=>`${esc(k)}: ${esc(v)}`).join('; ') : '';
+    return `<div class="srcrow">
+      <span class="dot ${s.state==='ok'?'ok':(s.state||'error')}"
+        style="width:10px;height:10px;border-radius:50%;
+        background:${s.state==='ok'?'var(--ok)':'var(--err)'}"></span>
+      <span class="nm">${esc(s.name)}</span>
+      <span class="meta">${esc(s.type)} · ${esc(s.group)}
+        ${s.url?' · '+esc(s.url):''} ${hdr?' · '+hdr:''}</span>
+      ${del}</div>`;
+  }).join('');
+}
+async function addSource(){
+  const name = document.getElementById('s-name').value.trim();
+  const url = document.getElementById('s-url').value.trim();
+  const hdr = document.getElementById('s-hdr').value.trim();
+  const hdrval = document.getElementById('s-hdrval').value.trim();
+  const b = {name, type:'json', url,
+             group:document.getElementById('s-group').value};
+  if(hdr && hdrval) b.headers = {[hdr]: hdrval};
+  const r = await (await fetch('/admin/api/catalog/sources', {method:'POST',
+    headers:{'Content-Type':'application/json'},
+    body:JSON.stringify(b)})).json();
+  if(r.error){ document.getElementById('src-err').textContent=r.error; return; }
+  document.getElementById('s-name').value='';
+  document.getElementById('s-url').value='';
+  document.getElementById('s-hdrval').value='';
+  document.getElementById('src-err').textContent='';
+  await renderSourceList(); loadSources();
+}
+async function delSource(n){ if(!confirm('Удалить источник '+n+'?'))return;
+  await fetch(`/admin/api/catalog/sources/${n}/delete`,{method:'POST'});
+  if(ACTIVE_SRC===n) ACTIVE_SRC='official';
+  await renderSourceList(); loadSources(); }
+
 function search(){ clearTimeout(tmr);
   tmr=setTimeout(async()=>{
     const q=document.getElementById('q').value;
@@ -461,7 +572,7 @@ function search(){ clearTimeout(tmr);
     searching=true;
     cat.innerHTML='<div><span>ищу…</span></div>';
     try{
-      const d=await (await fetch(`/admin/api/catalog?query=${encodeURIComponent(q)}`)).json();
+      const d=await (await fetch(`/admin/api/catalog?source=${encodeURIComponent(ACTIVE_SRC)}&query=${encodeURIComponent(q)}`)).json();
       CAT_ITEMS = d.items||[];
       cat.innerHTML = CAT_ITEMS.map((i,idx)=>`
         <div data-idx="${idx}" class="cat-item" style="cursor:pointer">
@@ -480,7 +591,13 @@ function search(){ clearTimeout(tmr);
 function pick(i){
   document.getElementById('f-name').value=i.name;
   PICKED_FIELDS = i.form_fields || [];
-  if(i.url){ document.getElementById('f-kind').value='url'; }
+  if(i.url){ document.getElementById('f-kind').value='url';
+    document.getElementById('f-main').value=i.url; }
+  else if(i.command){ document.getElementById('f-kind').value='command';
+    // карточки json-источников несут command+args целиком
+    const args = i.args||[];
+    document.getElementById('f-main').value =
+      args.length ? args.join(' ') : (i.install||i.command); }
   else if(i.install){ document.getElementById('f-kind').value='command';
     document.getElementById('f-main').value=i.install; }
   kindChanged();

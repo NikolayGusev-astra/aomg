@@ -4,7 +4,7 @@ gateway_port: 9300
 
 groups:
   direct:    {name: "Дом (напрямую)", proxy: null}
-  vpn:       {name: "Через VPN",      proxy: "socks5://127.0.0.1:10808"}
+  vpn:       {name: "Через VPN",      proxy: "socks5://127.0.0.1:1080"}
   corporate: {name: "Рабочая сеть",   proxy: "http://corp-gw:3128"}
 
 servers:
