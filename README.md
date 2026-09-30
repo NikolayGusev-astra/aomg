@@ -35,6 +35,11 @@ MCP в одном месте.
 
 ## Быстрый старт
 
+Готовые бинарники: [релиз v0.1.1](https://github.com/NikolayGusev-astra/aomg/releases/latest)
+(`AOMG.exe` + `mcp-proxy.exe` парой рядом + свой `config.yaml`).
+
+Из исходников:
+
 ```bash
 pip install -r requirements.txt
 copy config.example.yaml config.yaml   # поправь под себя
