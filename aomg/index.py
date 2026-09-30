@@ -28,6 +28,8 @@ from .registry import REGISTRY_BASE, parse_server_entry
 STALE_AFTER = 24 * 3600.0     # секунды; старше — индекс пора обновить
 PAGE_LIMIT = 100              # размер страницы /v0/servers
 MAX_PAGES = 100               # предохранитель от бесконечного cursor
+PAGE_ATTEMPTS = 3          # попыток на одну страницу: реестр иногда
+                           # не отвечает на конкретный cursor
 
 _WORD = re.compile(r"[a-z0-9]+")
 
@@ -122,22 +124,40 @@ class CatalogIndex:
     def sync(self, timeout: float = 60.0) -> int:
         """Полный слив реестра на диск. Возвращает число записей.
 
-        Бросает исключение, если реестр недоступен И на диске ничего нет;
-        при живом старом индексе ошибку глотаем — индекс остаётся как был.
+        Отдельная страница может не отвечать — реестр роняет запрос по
+        некоторым курсорам (наблюдалось на `ai.borealhost/mcp:0.4.2`).
+        Раньше такая страница убивала весь sync и индекс оставался пустым
+        при доступном реестре. Теперь страница повторяется ограниченное
+        число раз, затем пропускается, а уже собранные записи
+        сохраняются.
+
+        Бросает исключение, только если не удалось получить ни одной
+        страницы И на диске ничего нет; при живом старом индексе
+        ошибку глотаем — индекс остаётся как был.
         """
         old = self.load()
         rows: list[dict] = []
         seen: set[str] = set()
         cursor: str | None = ""
+        pages = 0
         with httpx.Client(timeout=httpx.Timeout(timeout, connect=10.0),
                           trust_env=False) as c:
             for _ in range(MAX_PAGES):
                 params: dict = {"limit": PAGE_LIMIT}
                 if cursor:
                     params["cursor"] = cursor
-                r = c.get(f"{REGISTRY_BASE}/v0/servers", params=params)
-                r.raise_for_status()
-                batch = r.json().get("servers", [])
+                batch, nxt = [], None
+                for _attempt in range(PAGE_ATTEMPTS):
+                    try:
+                        r = c.get(f"{REGISTRY_BASE}/v0/servers", params=params)
+                        r.raise_for_status()
+                        body = r.json()
+                        batch = body.get("servers", []) or []
+                        nxt = (body.get("metadata", {}) or {}).get("nextCursor")
+                        break
+                    except Exception:
+                        continue
+                pages += 1
                 for row in batch:
                     if not isinstance(row, dict):
                         continue
@@ -149,11 +169,14 @@ class CatalogIndex:
                     seen.add(name)
                     seen.add(short)
                     rows.append(row)
-                cursor = r.json().get("metadata", {}).get("nextCursor")
-                if not cursor or not batch:
+                if not nxt or not batch:
+                    # нет курсора — конец; сорванная страница тоже конец:
+                    # продолжать с того же места бессмысленно
                     break
+                cursor = nxt
         if not rows and old is None:
-            raise RuntimeError("registry returned no servers")
+            raise RuntimeError(f"registry returned no servers "
+                               f"(pages={pages})")
         if rows:
             self._save(rows)
             return len(rows)
