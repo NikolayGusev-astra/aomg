@@ -36,7 +36,12 @@ MCP в одном месте.
 ## Быстрый старт
 
 Готовые бинарники: [релиз v0.1.1](https://github.com/NikolayGusev-astra/aomg/releases/latest)
-(`AOMG.exe` + `mcp-proxy.exe` парой рядом + свой `config.yaml`).
+
+- **Инсталлятор** `AOMG-setup-*.exe` — per-user установка в
+  `%LOCALAPPDATA%\Programs\AOMG`, ярлыки, опциональный автозапуск
+  (чекбоксы в мастере). Свой `config.yaml` клади в папку установки
+  (шаблон `config.example.yaml` уже там).
+- Или вручную: `AOMG.exe` + `mcp-proxy.exe` парой рядом + свой `config.yaml`.
 
 Из исходников:
 
@@ -44,6 +49,15 @@ MCP в одном месте.
 pip install -r requirements.txt
 copy config.example.yaml config.yaml   # поправь под себя
 python run.py                          # иконка в трее
+```
+
+Сборка инсталлятора (нужен [Inno Setup 6](https://jrsoftware.org/isdl.php)):
+
+```bash
+python -m PyInstaller AOMG.spec --noconfirm
+python -m PyInstaller mcpproxy.spec --noconfirm
+"C:/Program Files (x86)/Inno Setup 6/ISCC.exe" installer.iss
+# -> dist/installer/AOMG-setup-<версия>.exe
 ```
 
 Пример конфига:
