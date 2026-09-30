@@ -45,6 +45,10 @@ def main() -> int:
     gw_thread = serve_in_thread(cfg, sup, healths, configure=configure)
     start_watchdog(cfg, sup, healths, interval=30.0)
 
+    # прогрев каталога: индекс реестра должен быть свежим к открытию админки
+    from aomg.index import CatalogIndex, warm
+    warm(CatalogIndex(cfg_path.parent / "registry-index.json"))
+
     if args.no_tray:
         while gw_thread.is_alive():
             time.sleep(1)

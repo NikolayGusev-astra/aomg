@@ -18,9 +18,26 @@ from fastapi.responses import HTMLResponse
 from .config import Config, ServerSpec, atomic_save_config, load_config
 from .health import Health, aggregate_state
 from .registry import REGISTRY_BASE, parse_server_entry
+from .registry import search as registry_search
 from .supervisor import Supervisor
 
 _SECRET_RE = re.compile(r"(key|token|password|pat|secret)", re.I)
+
+
+def _entry_to_item(e) -> dict:
+    """RegistryEntry -> карточка каталога (формат ответа /admin/api/catalog)."""
+    if e.kind == "http" and e.remote_url:
+        url, install = e.remote_url, None
+    elif e.package:
+        url, install = None, e.package.get("identifier")
+    else:
+        return {}
+    return {
+        "name": (e.name or "").split("/")[-1],
+        "title": e.title, "kind": e.kind, "url": url,
+        "description": (e.description or "")[:140],
+        "install": install,
+        "form_fields": e.form_fields}
 
 
 def _is_secret(k: str) -> bool:
@@ -60,76 +77,42 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
 
     @app.get("/admin/api/catalog")
     def api_catalog(query: str = "") -> dict:
-        """Поиск в официальном реестре MCP. Реестр бывает медленным (до ~45с):
-        длинный таймаут + один ретрай, дедупликация записей, TTL-кэш сутки
-        (повторный поиск мгновенный и не зависит от флапов реестра)."""
-        import json as _json
+        """Поиск в официальном реестре MCP через локальный индекс (aomg/index.py):
+        поиск мгновенный, по дисковому снапшоту; реестр ходит только фоновая
+        синхронизация (stale-while-revalidate). Если индекса ещё нет — один
+        живой запрос с коротким таймаутом, чтобы не висеть минуту."""
         import time as _time
 
-        import httpx
+        from . import index as _index
 
-        cache: dict = getattr(api_catalog, "_cache", None)
-        if cache is None:
-            cache = api_catalog._cache = {}  # query -> (ts, items)
+        idx: _index.CatalogIndex = getattr(api_catalog, "_index", None)
+        if idx is None:
+            idx = api_catalog._index = _index.CatalogIndex(
+                config_path.parent / "registry-index.json")
 
         q = query or "mcp"
-        hit = cache.get(q)
-        if hit and _time.time() - hit[0] < 86400:
-            return {"items": hit[1], "cached": True}
+        stale = idx.is_stale()
+        items = idx.search(q, limit=20)
+        if items:
+            if stale:
+                idx.ensure_fresh()  # фоново обновит, ответ не ждём
+            return {"items": items, "cached": stale, "source": "index"}
+        # индекс пуст (первый запуск и sync ещё не дошёл) — живой фолбэк
         try:
-            rows: list = []
-            with httpx.Client(timeout=httpx.Timeout(60.0, connect=10.0),
-                              trust_env=False) as c:
-                for attempt in (1, 2):
-                    try:
-                        r = c.get(f"{REGISTRY_BASE}/v0/servers",
-                                  params={"search": q, "limit": 20})
-                        rows = r.json().get("servers", [])
-                        break
-                    except (httpx.ReadTimeout, httpx.ConnectError):
-                        if attempt == 2:
-                            raise
-                        _time.sleep(1.0)
-            entries = []
-            seen: set[str] = set()
-            for x in rows:
-                if not isinstance(x, dict):
-                    continue
-                try:
-                    e = parse_server_entry(x)
-                except ValueError:
-                    continue  # deprecated/inactive — пропускаем
-                # дедуп по полному имени, затем по короткому (реестр отдаёт
-                # один пакет под несколькими namespace: io.github.x/mcp,
-                # io.y/mcp -> короткое 'mcp' трижды)
-                short = (e.name or "").split("/")[-1]
-                if e.name in seen or short in seen:
-                    continue
-                seen.add(e.name)
-                seen.add(short)
-                entries.append(e)
-            items = []
-            for e in entries:
-                if e.kind == "http" and e.remote_url:
-                    url, install = e.remote_url, None
-                elif e.package:
-                    url, install = None, e.package.get("identifier")
-                else:
-                    continue
-                items.append({
-                    "name": (e.name or "").split("/")[-1],
-                    "title": e.title, "kind": e.kind, "url": url,
-                    "description": (e.description or "")[:140],
-                    "install": install,
-                    "form_fields": e.form_fields})
-            if items:
-                cache[q] = (_time.time(), items)
-            return {"items": items}
+            entries = registry_search(q, limit=20)
         except Exception as ex:
-            # упавший реестр не должен смывать вчерашний кэш
-            if hit:
-                return {"items": hit[1], "cached": True}
             return {"items": [], "error": str(ex)[:150]}
+        items = [_entry_to_item(e) for e in entries if _entry_to_item(e)]
+        if items:
+            try:
+                idx.ensure_fresh()  # дольём полный индекс в фоне
+            except Exception:
+                pass
+            return {"items": items, "cached": False, "source": "live"}
+        # пусто и в реестре: возможно, индекс протух — обновим в фоне
+        if stale:
+            idx.ensure_fresh()
+        return {"items": [], "cached": False, "source": "live"}
 
     @app.get("/admin/api/groups")
     def api_groups() -> dict:
@@ -342,7 +325,7 @@ function search(){ clearTimeout(tmr);
     const cat=document.getElementById('cat');
     if(searching) return;   // предыдущий запрос ещё летит — не плодить
     searching=true;
-    cat.innerHTML='<div><span>ищу в реестре… (бывает до минуты)</span></div>';
+    cat.innerHTML='<div><span>ищу…</span></div>';
     try{
       const d=await (await fetch(`/admin/api/catalog?query=${encodeURIComponent(q)}`)).json();
       CAT_ITEMS = d.items||[];
@@ -351,7 +334,7 @@ function search(){ clearTimeout(tmr);
           <b>${esc(i.title||i.name)}</b><span>${esc((i.description||'').slice(0,90))}</span>
         </div>`).join('') || '<div><span>ничего не найдено</span></div>';
       if(d.error) cat.innerHTML+=`<div><span style="color:var(--err)">${esc(d.error)}</span></div>`;
-      if(d.cached) cat.innerHTML+='<div><span style="opacity:.6">из кэша</span></div>';
+      if(d.cached) cat.innerHTML+='<div><span style="opacity:.6">из локального индекса (обновляется в фоне)</span></div>';
       cat.querySelectorAll('.cat-item').forEach(el=>{
         el.addEventListener('click', ()=>pick(CAT_ITEMS[+el.dataset.idx]));
       });
