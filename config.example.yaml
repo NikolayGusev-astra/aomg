@@ -1,5 +1,14 @@
-# AOMG example config — скопируй в config.yaml и поправь под себя
-# Секреты: только ${VAR}-плейсхолдеры, значения берутся из окружения при старте.
+# AOMG example config — скопируй в config.yaml и поправь под себя.
+#
+# Серверов здесь намеренно НЕТ. Причина: пример из документации,
+# который не запускается на машине юзера, хуже отсутствия примера.
+# AOMG поднимает stdio-детей сам и рестартует их при падении, поэтому
+# мёртвый демо-сервер превращается в бесконечный рестарт-цикл в трее
+# и в логах (ADR-0004: рестарт конечен, но шум был реальный).
+# Добавь серверы через панель: http://127.0.0.1:<порт>/admin
+#
+# Секреты: только ${VAR}-плейсхолдеры, значения берутся из окружения
+# при старте. Реальные значения в config.yaml не пишутся никогда.
 gateway_port: 9300
 
 groups:
@@ -7,29 +16,38 @@ groups:
   vpn:       {name: "Через VPN",      proxy: "socks5://127.0.0.1:1080"}
   corporate: {name: "Рабочая сеть",   proxy: "http://corp-gw:3128"}
 
-servers:
-  # Локальный stdio-сервер (npm/npx). ВАЖНО: pin версии, если пакет
-  # тянет mcp 2.x (FastMCP переименован в MCPServer) - тогда '<2':
-  weather:
-    command: "uvx"
-    args: ["--from", "mcp-server-weather", "mcp-server-weather"]
-    group: direct
+servers: {}
 
-  # Удалённый HTTP-сервер с ключом:
-  github:
-    url: "https://api.githubcopilot.com/mcp/"
-    group: vpn
-    headers: {Authorization: "Bearer ${GITHUB_PAT}"}
+# Оба вида серверов — для справки, раскомментируй и поправь под себя.
+# Локальный stdio-ребёнок (npx/uvx/exe). Пини версию, если пакет тянет
+# mcp 2.x: FastMCP переименован в MCPServer, и сервер падает на
+# initialize — AOMG покажет причину, но чинить код не станет.
+#
+#   weather:
+#     command: "npx"
+#     args: ["-y", "@modelcontextprotocol/server-filesystem@0.6.2", "D:/work"]
+#     group: direct
+#
+# Удалённый HTTP-сервер с ключом из окружения:
+#
+#   github:
+#     url: "https://api.githubcopilot.com/mcp/"
+#     group: vpn
+#     headers: {Authorization: "Bearer ${GITHUB_PAT}"}
+#
+# Локальный exe с env-секретом. NO_PROXY="*" — корпоративные дети
+# не должны ходить через прокси хоста:
+#
+#   my-corp-mcp:
+#     command: "C:/tools/corp-mcp.exe"
+#     group: corporate
+#     env: {API_KEY: "${CORP_KEY}", NO_PROXY: "*"}
 
-  # Локальный exe с env-секретом; NO_PROXY="*" - корпоративные дети не ходят через прокси:
-  my-corp-mcp:
-    command: "C:/tools/corp-mcp.exe"
-    group: corporate
-    env: {API_KEY: "${CORP_KEY}", NO_PROXY: "*"}
-
-  # Дымовый сервер из tests/ - путь ОТНОСИТЕЛЬНО КОРНЯ РЕПО (запуск из исходников).
-  # Для установленного exe используй абсолютный путь или убери этот сервер.
-  fake:
-    command: "python"
-    args: ["tests/fixtures/fake_stdio_server.py"]
-    group: direct
+# Источники каталога, кроме встроенных official/neuraldeep.
+# Каждый источник получает прокси своей группы — group не декоративный.
+catalog_sources:
+  # corp:
+  #   type: json
+  #   url: "https://corp.example/mcp-servers.json"
+  #   group: corporate
+  #   headers: {Authorization: "Bearer ${CORP_TOKEN}"}

@@ -48,7 +48,11 @@ Source: "dist\AOMG\_internal\*"; DestDir: "{app}\_internal"; \
 Source: "dist\AOMG\mcp-proxy.exe"; DestDir: "{app}"; Flags: ignoreversion
 Source: "dist\AOMG\mcp_proxy_internal\*"; DestDir: "{app}\mcp_proxy_internal"; \
     Flags: ignoreversion recursesubdirs createallsubdirs
-Source: "config.example.yaml"; DestDir: "{app}"; Flags: ignoreversion
+; example-конфиг НЕ едет в {app} как "config.yaml": первый запуск сам
+; создаёт чистый config.yaml с проверенным портом (ADR-0006). Если рядом
+; с exe лежит недописанный пример, юзер думает, что его правки применены.
+Source: "config.example.yaml"; DestDir: "{app}\docs"; \
+    Flags: ignoreversion
 Source: "README.md"; DestDir: "{app}"; Flags: ignoreversion
 Source: "LICENSE"; DestDir: "{app}"; Flags: ignoreversion
 

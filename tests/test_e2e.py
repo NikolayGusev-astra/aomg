@@ -43,7 +43,10 @@ def gateway(tmp_path_factory):
         % (GATEWAY_PORT, sys.executable.replace("\\", "/"), str(FAKE_SERVER).replace("\\", "/")),
         encoding="utf-8")
 
-    env = {"AOMG_CONFIG": str(cfg_file)}
+    env = {"AOMG_CONFIG": str(cfg_file),
+           # watchdog раз в секунду: тест рестарта обязан уложиться
+           # в разумное время, а боевой дефолт — 30 с
+           "AOMG_WATCH_INTERVAL": "1"}
     import os
     proc = subprocess.Popen(
         [sys.executable, str(ROOT / "run.py"), "--no-tray"],
@@ -68,6 +71,21 @@ def gateway(tmp_path_factory):
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
             proc.kill()
+        # дети (mcp-proxy + stdio-сервер) переживают родителя: без этого
+        # они копятся между прогонами и держат файлы сборки открытыми
+        out = subprocess.run(["wmic", "process", "get", "processid,commandline"],
+                             capture_output=True)
+        raw = out.stdout
+        txt = (raw.decode("utf-16-le", errors="replace")
+               if raw[:2] == b"\xff\xfe" else raw.decode(errors="replace"))
+        for line in txt.splitlines():
+            low = line.lower()
+            if "fake_stdio" not in low and "mcp_proxy --port" not in low:
+                continue
+            parts = line.split()
+            if parts and parts[-1].isdigit() and int(parts[-1]) > 3:
+                subprocess.run(["taskkill", "/F", "/PID", parts[-1]],
+                               capture_output=True)
 
 
 def _tools_list(base, name):
@@ -105,13 +123,44 @@ def test_gateway_health_reports_ok(gateway):
 
 
 def test_child_restart_after_kill(gateway):
+    """Ребёнок убит — watchdog обязан поднять новый, и PID обязан смениться.
+
+    Проверяем не «через 4 с стало ок», а «новый процесс действительно
+    другой»: иначе тест проходил бы, когда рестарт не случился вовсе.
+    """
     data = httpx.get(f"{gateway}/health", timeout=5).json()
-    pid = next(s for s in data["servers"] if s["name"] == "fake")["pid"]
-    subprocess.run(["taskkill", "/F", "/PID", str(pid)], check=False)
-    time.sleep(4)  # супервизор должен заметить и поднять
-    result = _tools_list(gateway, "fake")
-    tools = [t["name"] for t in result["result"]["tools"]]
-    assert "fake_echo" in tools, "после смерти ребёнка гейтвей снова отвечает"
+    old_pid = next(s for s in data["servers"] if s["name"] == "fake")["pid"]
+    assert old_pid, "у живого stdio-сервера обязан быть pid"
+    subprocess.run(["taskkill", "/F", "/PID", str(old_pid)], check=False)
+
+    # ждём новый pid, а не фиксированное время
+    deadline = time.time() + 20.0
+    new_pid = old_pid
+    while time.time() < deadline:
+        time.sleep(0.5)
+        try:
+            body = httpx.get(f"{gateway}/health", timeout=5).json()
+        except Exception:
+            continue
+        entry = next((s for s in body["servers"]
+                      if s["name"] == "fake"), None)
+        if entry and entry.get("pid") and entry["pid"] != old_pid:
+            new_pid = entry["pid"]
+            break
+    assert new_pid != old_pid, \
+        f"ребёнок не перезапущен: pid остался {old_pid} — watchdog молчит"
+
+    # и канал снова работает
+    tools = None
+    deadline = time.time() + 20.0
+    while time.time() < deadline and tools is None:
+        try:
+            result = _tools_list(gateway, "fake")
+            tools = [t["name"] for t in result["result"]["tools"]]
+        except AssertionError:
+            time.sleep(0.5)
+    assert tools and "fake_echo" in tools, \
+        "после смерти ребёнка гейтвей снова отвечает"
 
 
 def test_unknown_path_404(gateway):
