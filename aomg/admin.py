@@ -72,11 +72,16 @@ def _mask_headers(hdrs: dict) -> dict:
 
 def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                    config_path: Path,
-                   restart_watchdog: callable) -> None:
+                   restart_watchdog: callable,
+                   index=None) -> None:
     """Роуты админки. config_path нужен для сохранения yaml.
 
     `healths` больше не параметр: состоянием владеет Supervisor
     (ADR-0003), панель читает его через health()/snapshot().
+
+    `index` — фоновый автосинк реестра (IndexSync). Раньше прогрев был
+    разовым и глотал исключения, из-за чего official выглядел пустым
+    все время обхода; теперь панель показывает реальный статус.
     """
 
     def health_of(name: str):
@@ -167,6 +172,22 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
         def status(self) -> tuple:
             return self.state, self.error
 
+        def _notice(self) -> str | None:
+            """Что показать, когда результатов нет.
+
+            Раньше пустой результат с непустым индексом помечался как
+            «реестр недоступен» - врёшь. Разводим три случая: идёт
+            синк, индекс есть, индекса нет вовсе.
+            """
+            if self._idx.last_sync_error:
+                return f"Реестр MCP недоступен: {self._idx.last_sync_error}"
+            if self._idx.syncing:
+                return "Синхронизация с реестром идёт, первый запуск занимает " \
+                       "несколько минут."
+            if not self._idx.load():
+                return "Индекс реестра пуст — запускается первая загрузка."
+            return None
+
         def search(self, query: str = "", limit: int = 50,
                    offset: int = 0) -> dict:
             found = self._idx.search(query, limit=limit + offset)
@@ -176,11 +197,15 @@ def register_admin(app: FastAPI, cfg: Config, supervisor: Supervisor,
                 card.setdefault("source", "official")
             if self._idx.is_stale():
                 self._idx.ensure_fresh()   # фоново, ответ не ждём
-                self.state, self.error = "ok", None
+            # Состояние правдивое: если sync упал, официальный источник
+            # не «доступен», а «реестр недоступен» (ADR-0005).
+            if self._idx.last_sync_error:
+                self.state, self.error = "error", self._idx.last_sync_error
             else:
                 self.state, self.error = "ok", None
             return {"items": items, "total": total,
-                    "has_more": offset + len(items) < total}
+                    "has_more": offset + len(items) < total,
+                    "notice": self._notice()}
 
     _build_catalog_sources()
     BUILTIN_SOURCES = ("official", "neuraldeep")
@@ -420,15 +445,25 @@ _PAGE = """<!doctype html>
   h1 span { color:var(--acc); }
   .sub { color:var(--mut); font-size:13px; margin:4px 0 22px; }
   .srv { background:var(--card); border:1px solid var(--line);
-         border-radius:12px; padding:16px 18px; margin-bottom:12px;
+         border-radius:12px; padding:14px 16px; margin-bottom:8px;
          display:flex; align-items:center; gap:14px; }
+  /* Проблемные сверху: упавший сервер не должен теряться в списке
+     из 16 рабочих строк. Порядок задаёт JS, не CSS. */
+  .srv.bad { border-color:var(--err); }
+  .srv .err-why { color:var(--err); font-size:12.5px; margin-top:3px;
+         white-space:pre-wrap; word-break:break-word; }
   .dot { width:12px; height:12px; border-radius:50%; flex:none; }
   .dot.ok{background:var(--ok)} .dot.reconnecting{background:var(--warn)}
   .dot.channel_down{background:var(--warn)} .dot.down{background:var(--err)}
   .info { flex:1; min-width:0; }
   .nm { font-weight:600; font-size:16px; }
+  .cnt { color:var(--mut); font-size:12.5px; font-variant-numeric:tabular-nums;
+         white-space:nowrap; }
   .meta { color:var(--mut); font-size:12.5px; margin-top:2px;
           white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+  .sec { color:var(--mut); font-size:12px; text-transform:uppercase;
+         letter-spacing:.06em; margin:18px 0 8px; }
+  .sec:first-child { margin-top:0; }
   .btn { background:transparent; border:1px solid var(--line);
          color:var(--mut); border-radius:8px; padding:6px 12px;
          font-size:13px; cursor:pointer; }
@@ -550,20 +585,32 @@ async function refresh(){
   const h = await (await fetch('/health')).json();
   const names = {ok:'работает',reconnecting:'перезапуск…',
                  channel_down:'нет сети',down:'не отвечает'};
+  const bad = h.servers.filter(s=>s.state!=='ok');
   document.getElementById('agg').textContent =
     h.aggregate==='ok' ? 'Всё работает' :
-    'Есть проблемы (' + h.servers.filter(s=>s.state!=='ok').length + ')';
-  document.getElementById('list').innerHTML = h.servers.map(s=>`
-    <div class="srv">
+    'Есть проблемы (' + bad.length + ')';
+
+  // Список делится на «проблемные» и «рабочие». Раньше порядок был
+  // случайным (порядок конфига), и упавший сервер тонул среди
+  // 16 зелёных строк - приходилось искать глазами.
+  const row = s => {
+    const why = s.error ? `<div class="err-why">${esc(s.error)}</div>` : '';
+    return `<div class="srv ${s.state==='ok'?'':'bad'}">
       <div class="dot ${s.state}"></div>
       <div class="info">
-        <div class="nm">${s.name}</div>
-        <div class="meta">${names[s.state]||s.state} · инструментов: ${s.tools}
-          ${s.error?' · '+s.error.slice(0,80):''}</div>
+        <div class="nm">${esc(s.name)}</div>
+        <div class="meta">${esc(names[s.state]||s.state)}</div>
+        ${why}
       </div>
-      <button class="btn" onclick="restart('${s.name}')">Перезапустить</button>
-      <button class="btn danger" onclick="del('${s.name}')">Удалить</button>
-    </div>`).join('');
+      <div class="cnt">${s.state==='ok'?s.tools+' тулов':'—'}</div>
+      <button class="btn" onclick="restart('${esc(s.name)}')">Перезапустить</button>
+      <button class="btn danger" onclick="del('${esc(s.name)}')">Удалить</button>
+    </div>`;
+  };
+  const sec = (t, arr) => arr.length
+    ? `<div class="sec">${t} · ${arr.length}</div>` + arr.map(row).join('') : '';
+  document.getElementById('list').innerHTML =
+    sec('Требует внимания', bad) + sec('Работают', h.servers.filter(s=>s.state==='ok'));
 }
 async function loadGroups(){
   GROUPS = (await (await fetch('/admin/api/groups')).json()).groups;

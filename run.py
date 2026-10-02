@@ -116,19 +116,31 @@ def main() -> int:
 
     from aomg.admin import register_admin
 
+    # Индекс реестра и его фоновый автосинк. Раньше здесь был разовый
+    # warm(), который глотал исключения и запускал полный обход реестра
+    # (~270 с на 2794 записи) на старте - панель всё это время
+    # показывала official пустым, и это приходилось объяснять как
+    # «честное окно». Теперь sync живёт в фоновом потоке, а панель
+    # читает его статус (ADR-0005).
+    from aomg.index import CatalogIndex, IndexSync
+
+    catalog_index = CatalogIndex(cfg_path.parent / "registry-index.json")
+    index_sync = IndexSync(
+        catalog_index,
+        interval=float(os.environ.get("AOMG_SYNC_INTERVAL") or 6 * 3600.0),
+        enabled=os.environ.get("AOMG_NO_AUTOSYNC") != "1")
+    index_sync.start()
+
     def configure(app):
         register_admin(app, cfg, sup, cfg_path,
-                       restart_watchdog=lambda: None)
+                       restart_watchdog=lambda: None,
+                       index=index_sync)
 
     gw_thread = serve_in_thread(cfg, sup, configure=configure)
     # Интервал watchdog настраивается: e2e обязан проверять рестарт
     # ребёнка за секунды, а не за полминуты (ADR-0004).
     interval = float(os.environ.get("AOMG_WATCH_INTERVAL") or 30.0)
     start_watchdog(cfg, sup, interval=interval)
-
-    # прогрев каталога: индекс реестра должен быть свежим к открытию админки
-    from aomg.index import CatalogIndex, warm
-    warm(CatalogIndex(cfg_path.parent / "registry-index.json"))
 
     if args.no_tray:
         while gw_thread.is_alive():

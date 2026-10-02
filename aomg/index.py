@@ -45,6 +45,7 @@ class CatalogIndex:
         self.path = path
         self.lock = threading.Lock()
         self.syncing = False
+        self.last_sync_error: str | None = None
         self._sync_thread: threading.Thread | None = None
         self._mem: tuple | None = None      # (mtime, data) — кэш load()
 
@@ -183,21 +184,30 @@ class CatalogIndex:
         return len(old["servers"]) if old else 0
 
     def ensure_fresh(self) -> bool:
-        """Фоново обновить индекс, если устарел. False = уже идёт sync."""
+        """Фоново обновить индекс, если устарел. False = уже идёт sync.
+
+        Ошибка не глотается молча: она попадает в last_sync_error, чтобы
+        панель могла сказать «реестр недоступен», а не «ничего не
+        нашлось» (ADR-0005 — правдивый статус).
+        """
         with self.lock:
             if self.syncing:
                 return False
             if not self.is_stale():
                 return False
             self.syncing = True
+
         def run():
             try:
                 self.sync()
-            except Exception:
-                pass  # старый индекс остаётся; попробуем в следующий раз
+                self.last_sync_error = None
+            except Exception as e:
+                # старый индекс остаётся; причина видна панели
+                self.last_sync_error = f"{type(e).__name__}: {e}"
             finally:
                 self.syncing = False
-        self._sync_thread = threading.Thread(target=run, daemon=True)
+        self._sync_thread = threading.Thread(target=run, daemon=True,
+                                             name="aomg-ensure-fresh")
         self._sync_thread.start()
         return True
 
@@ -252,9 +262,98 @@ class CatalogIndex:
         return [item for _, item in scored[:limit]]
 
 
-def warm(index: CatalogIndex) -> None:
-    """Разовый прогрев при старте: пусть индекс свежий к открытию админки."""
-    try:
-        index.ensure_fresh()
-    except Exception:
-        pass
+    def age(self) -> float | None:
+        """Сколько секунд прошло с последнего успешного sync, None - нет."""
+        data = self.load()
+        if not data:
+            return None
+        return max(0.0, time.time() - float(data.get("synced_at") or 0))
+
+    def is_stale(self, max_age: float = STALE_AFTER) -> bool:
+        """Индекс старше max_age секунд (или его нет вовсе).
+
+        Панель показывает это честно, а не отдаёт вчерашние данные
+        как свежие: раньше official выглядел пустым 5 минут после
+        старта, и это приходилось объяснять как норму.
+        """
+        a = self.age()
+        return a is None or a > max_age
+
+
+def read_mcp_requirement(metadata: dict | None) -> str | None:
+    """Минимальная версия mcp из Requires-Dist установленного пакета.
+
+    Нужна импортёру: сервер может требовать `mcp>=1.20.0` (Icon, meta=),
+    а в общем venv стоит 1.9.4 - падение выглядело бы как вина гейтвея.
+    """
+    for req in (metadata or {}).get("Requires-Dist") or []:
+        m = re.match(r"\s*mcp\s*>=\s*([\d.]+)", str(req))
+        if m:
+            return m.group(1)
+    return None
+
+
+class IndexSync:
+    """Фоновая автосинхронизация реестра.
+
+    Раньше `sync()` звался только вручную, поэтому после перезапуска
+    official оставался пустым на все время обхода (~270 с на 2794
+    записях). Здесь sync идёт в отдельном потоке, а панель может
+    показать его состояние, не блокируя UI.
+    """
+
+    def __init__(self, index: CatalogIndex, interval: float = 6 * 3600.0,
+                 timeout: float = 60.0, enabled: bool = True,
+                 max_age: float = STALE_AFTER):
+        self.index = index
+        self.interval = interval
+        self.timeout = timeout
+        self.enabled = enabled
+        self.max_age = max_age
+        self.last_count: int = 0
+        self.last_error: str | None = None
+        self.last_run: float | None = None
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._ready = threading.Event()
+
+    def start(self) -> bool:
+        if not self.enabled or self._thread is not None:
+            return self.enabled
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="aomg-index-sync")
+        self._thread.start()
+        return True
+
+    def _loop(self) -> None:
+        while not self._stop.is_set():
+            # индекс протух - тогда точно идём; свежий - ждём интервал
+            if self.index.is_stale(self.max_age):
+                self.run_once()
+            self._ready.set()
+            self._stop.wait(self.interval)
+
+    def run_once(self) -> int:
+        try:
+            n = self.index.sync(timeout=self.timeout)
+            self.last_count, self.last_error = n, None
+        except Exception as e:      # реестр недоступен - не теряем старый
+            self.last_error = f"{type(e).__name__}: {e}"
+        finally:
+            self.last_run = time.time()
+        return self.last_count
+
+    def wait_ready(self, timeout: float = 5.0) -> bool:
+        return self._ready.wait(timeout)
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join(timeout=5.0)
+            self._thread = None
+
+    def status(self) -> dict:
+        """Состояние для панели: чем занят индекс и почему пусто."""
+        return {"count": self.last_count, "error": self.last_error,
+                "last_run": self.last_run, "age": self.index.age(),
+                "running": self._thread is not None}
