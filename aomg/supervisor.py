@@ -95,6 +95,27 @@ def _open_log(name: str):
 
 _SECRET_PLACEHOLDER = re.compile(r"^\$\{[A-Za-z_][A-Za-z0-9_]*\}$")
 
+# Неразвёрнутый ${VAR} ВНУТРИ значения (в т.ч. составного: "Bearer ${T}").
+_UNRESOLVED_VAR = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def unresolved_vars(spec: ServerSpec) -> list[str]:
+    """${VAR}, оставшиеся литералом после load_config.
+
+    load_config._expand разворачивает плейсхолдеры из process-env и
+    HKCU\\Environment; если переменной нет ни там ни там, значение
+    доходит до спавна как литерал. Ребёнок получит мусорный ключ и
+    умрёт на initialize с невнятным auth-failed вместо честного
+    «переменная не задана». Ловим до спавна — по тем же причинам, что
+    и command_missing (один down с причиной вместо рестарт-цикла).
+    """
+    names: set[str] = set()
+    for src in (spec.env, spec.headers):
+        for v in src.values():
+            if isinstance(v, str):
+                names.update(_UNRESOLVED_VAR.findall(v))
+    return sorted(names)
+
 
 def collect_secret_values(env: dict, headers: dict,
                           extra: list | None = None) -> list[str]:
@@ -186,6 +207,12 @@ class ManagedServer:
         self.proc: subprocess.Popen | None = None
         self.proxy_port: int | None = None
         self._log_fh = None
+        # Спавн заблокирован предварительной проверкой (команда не найдена,
+        # секрет не развёрнут): down с причиной поставлен один раз, watchdog
+        # не должен гнать рестарт-цикл по заведомо неживому ребёнку
+        # (ADR-0004: конечность Popen). Снимается только stop() при
+        # смене спеки/ручном рестарте.
+        self.blocked: str | None = None
 
     def start(self, cfg: Config) -> None:
         if self.spec.kind != "stdio" or (self.proc and self.proc.poll() is None):
@@ -193,11 +220,23 @@ class ManagedServer:
         if command_missing(self.spec):
             # Не спавним заведомо мёртвую команду: один раз — и down с
             # внятной причиной, а не рестарт-цикл (ADR-0004).
+            self.blocked = f"команда не найдена: {self.spec.command}"
             self.health.record(
                 "down",
-                error=f"команда не найдена: {self.spec.command}",
+                error=self.blocked,
                 ts=time.time())
             return
+        missing = unresolved_vars(self.spec)
+        if missing:
+            # Не спавним ребёнка с неразвёрнутым секретом: он получит
+            # литерал ${VAR} и умрёт на initialize с ложным
+            # «auth failed». Один down с именами переменных вместо
+            # рестарт-цикла (тот же контракт, что и command_missing).
+            self.blocked = ("переменные окружения не заданы: "
+                            + ", ".join(f"${{{n}}}" for n in missing))
+            self.health.record("down", error=self.blocked, ts=time.time())
+            return
+        self.blocked = None
         env = {**os.environ, **self.spec.env}
         egress = cfg.egress_for(self.spec)
         if egress:
@@ -256,6 +295,11 @@ class ManagedServer:
 
     def alive(self) -> bool:
         if self.spec.kind != "stdio":
+            return True
+        if self.blocked:
+            # Ребёнок заведомо не спавнился: для политики рестарта он
+            # не «умер» — его вообще нет. alive=True держит watchdog
+            # от record_failure-цикла по вечному down.
             return True
         return self.proc is not None and self.proc.poll() is None
 
@@ -356,8 +400,13 @@ class Supervisor:
                 self.fails[name] = 0
                 self.next_allowed[name] = 0.0
             m.stop()
+            m.blocked = None   # ручной рестарт снимает блокировку спавна
         m.start(self.cfg)
         if manual:
+            if m.blocked:
+                # start() снова заблокировал и поставил честный down —
+                # не затираем его «перезапуском вручную»
+                return
             m.health.record("reconnecting",
                             error="перезапуск вручную", ts=time.time())
 
@@ -484,4 +533,9 @@ class Supervisor:
             state, tools, err = probe(name)
             if state == "ok":
                 self.note_alive(name)
+            elif m is not None and m.blocked:
+                # Сервер заблокирован предварительной проверкой: проба по
+                # несуществующему порту даёт channel_down и затёрла бы
+                # честную причину блокировки. Причину сохраняем.
+                state, err = "down", m.blocked
             h.record(state, tools=tools, error=err, ts=ts)

@@ -241,6 +241,111 @@ def test_existing_command_is_spawned(monkeypatch, tmp_path):
     assert sup.healths["real"].state == "reconnecting"
 
 
+# ---------- предварительная проверка секрета ----------
+
+def test_unresolved_env_var_blocks_spawn(monkeypatch, tmp_path):
+    """${VAR}, которого нет в окружении -> down с именем переменной,
+    без единого Popen. Ребёнок с литеральным ${VAR} умирает на
+    initialize с ложным «auth failed» (битва bitbucket/confluence),
+    причину нужно называть до спавна."""
+    monkeypatch.setattr("aomg.supervisor.subprocess.Popen", _FakePopen)
+    spawn_counter.clear()
+    exe = tmp_path / "auth-mcp.exe"
+    exe.write_text("x", encoding="utf-8")
+    cfg = Config(gateway_port=9392, groups={"direct": Group(name="Дом")})
+    spec = ServerSpec(name="locked", kind="stdio", command=str(exe),
+                      env={"BITBUCKET_PAT": "${BITBUCKET_PAT}"})
+    cfg.servers["locked"] = spec
+    sup = Supervisor(cfg)
+    sup.add("locked", spec)
+    assert spawn_counter == [], "сервер с неразвёрнутым секретом не спавним"
+    h = sup.healths["locked"]
+    assert h.state == "down"
+    assert "BITBUCKET_PAT" in (h.error or ""), h.error
+    assert "не задан" in (h.error or ""), h.error
+
+
+def test_unresolved_var_inside_composite_value_is_caught(monkeypatch, tmp_path):
+    """${VAR} внутри составного значения ("Bearer ${T}") тоже ловится:
+    регулярка не привязана к началу строки."""
+    monkeypatch.setattr("aomg.supervisor.subprocess.Popen", _FakePopen)
+    spawn_counter.clear()
+    exe = tmp_path / "hdr-mcp.exe"
+    exe.write_text("x", encoding="utf-8")
+    cfg = Config(gateway_port=9393, groups={"direct": Group(name="Дом")})
+    spec = ServerSpec(name="hdr", kind="stdio", command=str(exe))
+    spec.headers = {"Authorization": "Bearer ${API_TOKEN}"}
+    cfg.servers["hdr"] = spec
+    sup = Supervisor(cfg)
+    sup.add("hdr", spec)
+    assert spawn_counter == []
+    h = sup.healths["hdr"]
+    assert h.state == "down"
+    assert "API_TOKEN" in (h.error or ""), h.error
+
+
+def test_resolved_secret_still_spawns(monkeypatch, tmp_path):
+    """Плейсхолдер, развёрнутый load_config, спавн не блокирует."""
+    monkeypatch.setattr("aomg.supervisor.subprocess.Popen", _FakePopen)
+    spawn_counter.clear()
+    exe = tmp_path / "ok-mcp.exe"
+    exe.write_text("x", encoding="utf-8")
+    cfg = Config(gateway_port=9394, groups={"direct": Group(name="Дом")})
+    spec = ServerSpec(name="fine", kind="stdio", command=str(exe),
+                      env={"SOME_PAT": "real-token-value-123"})
+    cfg.servers["fine"] = spec
+    sup = Supervisor(cfg)
+    sup.add("fine", spec)
+    assert len(spawn_counter) == 1
+    assert sup.healths["fine"].state == "reconnecting"
+
+
+def test_blocked_server_no_restart_loop(monkeypatch, tmp_path):
+    """I1-инвариант для блокировки: watchdog-проходы по серверу с
+    неразвёрнутым секретом не порождают ни одного нового Popen и не
+    затирают честную причину down."""
+    monkeypatch.setattr("aomg.supervisor.subprocess.Popen", _FakePopen)
+    spawn_counter.clear()
+    exe = tmp_path / "blocked-mcp.exe"
+    exe.write_text("x", encoding="utf-8")
+    cfg = Config(gateway_port=9395, groups={"direct": Group(name="Дом")})
+    spec = ServerSpec(name="blocked", kind="stdio", command=str(exe),
+                      env={"MISSING_TOKEN": "${MISSING_TOKEN}"})
+    cfg.servers["blocked"] = spec
+    sup = Supervisor(cfg)
+    sup.add("blocked", spec)
+    assert sup.healths["blocked"].state == "down"
+
+    # множество проходов watchdog: спавнов нет, состояние и причина стабильны
+    for _ in range(10):
+        sup.watch_tick(time.time() + 3600.0,
+                       probe=lambda n: ("channel_down", 0, "connect error"))
+    assert spawn_counter == [], "watchdog не должен спавнить заблокированный сервер"
+    h = sup.healths["blocked"]
+    assert h.state == "down"
+    assert "MISSING_TOKEN" in (h.error or ""), h.error
+
+
+def test_manual_restart_clears_block(monkeypatch, tmp_path):
+    """Ручной рестарт снимает блокировку и пробует спавн снова."""
+    monkeypatch.setattr("aomg.supervisor.subprocess.Popen", _FakePopen)
+    spawn_counter.clear()
+    exe = tmp_path / "manual-mcp.exe"
+    exe.write_text("x", encoding="utf-8")
+    cfg = Config(gateway_port=9396, groups={"direct": Group(name="Дом")})
+    spec = ServerSpec(name="manual", kind="stdio", command=str(exe),
+                      env={"MISSING_TOKEN": "${MISSING_TOKEN}"})
+    cfg.servers["manual"] = spec
+    sup = Supervisor(cfg)
+    sup.add("manual", spec)
+    assert spawn_counter == []
+    sup.restart("manual", manual=True)
+    # спек не менялся, секрет по-прежнему не задан: спавна снова нет,
+    # но блокировка переоценена, а не прилипла навсегда
+    assert spawn_counter == []
+    assert sup.healths["manual"].state == "down"
+
+
 # ---------- watchdog: один плохой сервер не роняет цикл ----------
 
 def test_watch_once_survives_dead_and_live_servers(dead_stdio):
